@@ -1,0 +1,39 @@
+From a7501d5ade8cba3784f518fa15707c3e3587f656 Mon Sep 17 00:00:00 2001
+From: nomorecoolnicknames <78512247+nomorecoolnicknames@users.noreply.github.com>
+Date: Fri, 10 Jul 2026 14:16:39 -0500
+Subject: [PATCH] ASoC: msm8916-wcd-digital: expose TX capture mute switches
+
+The LPASS codec has a hardware TX mute bit (TXn_VOL_CTL_CFG bit 0)
+that the decimator DAPM sequence already uses internally, but no
+kcontrol exposes it. In-call mic mute needs it: the modem-DSP voice
+uplink bypasses userspace PCMs, so a userspace soft mute cannot
+silence the mic. Add inverted "TXn Capture Switch" controls
+(on = unmuted) for use as a UCM CaptureSwitch.
+
+Signed-off-by: nomorecoolnicknames <78512247+nomorecoolnicknames@users.noreply.github.com>
+Assisted-by: Claude (Anthropic)
+---
+ sound/soc/codecs/msm8916-wcd-digital.c | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/sound/soc/codecs/msm8916-wcd-digital.c b/sound/soc/codecs/msm8916-wcd-digital.c
+index e14c94aaa..83d24e93d 100644
+--- a/sound/soc/codecs/msm8916-wcd-digital.c
++++ b/sound/soc/codecs/msm8916-wcd-digital.c
+@@ -521,6 +521,13 @@ static const struct snd_kcontrol_new msm8916_wcd_digital_snd_controls[] = {
+ 	SOC_ENUM("TX2 HPF Cutoff", tx2_hpf_cutoff_enum),
+ 	SOC_SINGLE("TX1 HPF Switch", LPASS_CDC_TX1_MUX_CTL, 3, 1, 0),
+ 	SOC_SINGLE("TX2 HPF Switch", LPASS_CDC_TX2_MUX_CTL, 3, 1, 0),
++	/*
++	 * Hardware TX (decimator) mute, needed for in-call mic mute: the DSP
++	 * voice uplink never passes through a userspace PCM, so a userspace
++	 * soft mute cannot silence it. Inverted: switch on = capture unmuted.
++	 */
++	SOC_SINGLE("TX1 Capture Switch", LPASS_CDC_TX1_VOL_CTL_CFG, 0, 1, 1),
++	SOC_SINGLE("TX2 Capture Switch", LPASS_CDC_TX2_VOL_CTL_CFG, 0, 1, 1),
+ 	SOC_ENUM("RX1 DCB Cutoff", rx1_dcb_cutoff_enum),
+ 	SOC_ENUM("RX2 DCB Cutoff", rx2_dcb_cutoff_enum),
+ 	SOC_ENUM("RX3 DCB Cutoff", rx3_dcb_cutoff_enum),
+-- 
+2.39.5
+

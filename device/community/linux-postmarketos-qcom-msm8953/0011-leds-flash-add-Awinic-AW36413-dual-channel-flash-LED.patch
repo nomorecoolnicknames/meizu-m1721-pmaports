@@ -1,0 +1,771 @@
+From 0cde2c771fab89d4909746a56fe635fd0ccbee86 Mon Sep 17 00:00:00 2001
+From: nomorecoolnicknames <78512247+nomorecoolnicknames@users.noreply.github.com>
+Date: Fri, 10 Jul 2026 14:17:40 -0500
+Subject: [PATCH] leds: flash: add Awinic AW36413 dual-channel flash LED driver
+
+Add a LED-class-flash driver for the Awinic AW36413, an
+LM3644-register-family dual flash LED controller with an I2C
+interface, a hardware enable pin (HWEN) and an optional hardware
+strobe input. The Meizu M6 Note (m1721, MSM8953) drives its quad-LED
+rear ring flash with two of these chips.
+
+Register map (from the downstream msm_flash driver, confirmed on
+hardware): 0x00 chip id (0x36), 0x01 ENABLE (bits[1:0] LED enables,
+bits[3:2] mode 10=torch/11=flash), 0x03/0x04 LED1/LED2 flash level,
+0x05/0x06 torch level, 0x08 timing (ramp[6:4]/timeout[3:0]), 0x0a/0x0b
+fault flags, 0x0c device id. Current formulas come from the downstream
+driver: torch I = code * 5.6 mA + 2.8 mA (capped at 300 mA/LED), flash
+I = code * 23.44 mA + 11.74 mA (capped at 1500 mA/LED).
+
+The critical quirk: the chip arms its boost converter on a HWEN rising
+edge, not on a static high level. With HWEN simply held high it ACKs
+on I2C and accepts every register write, but the LED outputs stay dark
+(no fault flags set). The vendor driver power-cycles HWEN
+(OFF ~5 ms -> ON ~5 ms) before every LED enable. This driver therefore
+keeps HWEN low whenever all outputs are off and generates a full
+OFF->ON cycle on each (re)enable, rewriting the level registers
+afterwards since HWEN low also powers the register core down (for the
+same reason the regmap is uncached).
+
+Modeled on leds-lm3601x and leds-sy7802: regmap-i2c, fwnode child
+parsing with led-sources (1-2 children, joint mode supported), torch
+via brightness_set_blocking, flash via the LED flash class
+strobe/timeout/fault ops (software strobe over I2C; the strobe pin is
+parked low).
+
+Cross-compiled clean for arm64 (CONFIG_LEDS_AW36413=m, W=1).
+
+Signed-off-by: nomorecoolnicknames <78512247+nomorecoolnicknames@users.noreply.github.com>
+Assisted-by: Claude (Anthropic)
+---
+ drivers/leds/flash/Kconfig        |  13 +
+ drivers/leds/flash/Makefile       |   1 +
+ drivers/leds/flash/leds-aw36413.c | 680 ++++++++++++++++++++++++++++++
+ 3 files changed, 694 insertions(+)
+ create mode 100644 drivers/leds/flash/leds-aw36413.c
+
+diff --git a/drivers/leds/flash/Kconfig b/drivers/leds/flash/Kconfig
+index 5e08102a6..436184c16 100644
+--- a/drivers/leds/flash/Kconfig
++++ b/drivers/leds/flash/Kconfig
+@@ -20,6 +20,19 @@ config LEDS_AS3645A
+ 	  controller. V4L2 flash API is provided as well if
+ 	  CONFIG_V4L2_FLASH_API is enabled.
+ 
++config LEDS_AW36413
++	tristate "LED support for the Awinic AW36413"
++	depends on I2C
++	depends on GPIOLIB || COMPILE_TEST
++	select REGMAP_I2C
++	help
++	  This option enables support for the Awinic AW36413 dual-channel
++	  flash LED controller (LM3644 register family), e.g. the two chips
++	  driving the quad-LED rear flash of the Meizu M6 Note.
++
++	  To compile this driver as a module, choose M here: the module
++	  will be called leds-aw36413.
++
+ config LEDS_KTD2692
+ 	tristate "LED support for Kinetic KTD2692 flash LED controller"
+ 	depends on OF
+diff --git a/drivers/leds/flash/Makefile b/drivers/leds/flash/Makefile
+index 712fb737a..dc8a001c4 100644
+--- a/drivers/leds/flash/Makefile
++++ b/drivers/leds/flash/Makefile
+@@ -4,6 +4,7 @@ obj-$(CONFIG_LEDS_MT6360)	+= leds-mt6360.o
+ obj-$(CONFIG_LEDS_MT6370_FLASH)	+= leds-mt6370-flash.o
+ obj-$(CONFIG_LEDS_AAT1290)	+= leds-aat1290.o
+ obj-$(CONFIG_LEDS_AS3645A)	+= leds-as3645a.o
++obj-$(CONFIG_LEDS_AW36413)	+= leds-aw36413.o
+ obj-$(CONFIG_LEDS_KTD2692)	+= leds-ktd2692.o
+ obj-$(CONFIG_LEDS_LM3601X)	+= leds-lm3601x.o
+ obj-$(CONFIG_LEDS_MAX77693)	+= leds-max77693.o
+diff --git a/drivers/leds/flash/leds-aw36413.c b/drivers/leds/flash/leds-aw36413.c
+new file mode 100644
+index 000000000..148634143
+--- /dev/null
++++ b/drivers/leds/flash/leds-aw36413.c
+@@ -0,0 +1,680 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Awinic AW36413 dual-channel flash LED controller
++ *
++ * Copyright (C) 2026 nomorecoolnicknames <78512247+nomorecoolnicknames@users.noreply.github.com>
++ *
++ * The AW36413 is an LM3644-register-family dual flash LED driver with an
++ * I2C interface, a hardware enable pin (HWEN) and an optional hardware
++ * strobe input. The Meizu M6 Note (m1721) uses two of them for its
++ * quad-LED rear ring flash.
++ *
++ * Hardware quirk: the chip arms its boost converter on a *rising edge*
++ * of HWEN, not on a static high level.
++ * With HWEN simply held high the chip ACKs on I2C, accepts register
++ * writes and even latches the flash-timeout flag, but the LED outputs
++ * stay dark. The vendor driver power-cycles HWEN (OFF ~5 ms -> ON ~5 ms)
++ * before every LED enable. This driver keeps HWEN low while all outputs
++ * are off and generates a full OFF->ON cycle whenever an output is
++ * (re)enabled. HWEN low also powers the register core down, so all level
++ * registers are rewritten after every cycle (and the regmap is uncached).
++ */
++
++#include <linux/delay.h>
++#include <linux/gpio/consumer.h>
++#include <linux/i2c.h>
++#include <linux/kernel.h>
++#include <linux/led-class-flash.h>
++#include <linux/leds.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/of.h>
++#include <linux/property.h>
++#include <linux/regmap.h>
++
++#define AW36413_MAX_LEDS		2
++
++/* Registers (LM3644 family) */
++#define AW36413_REG_CHIP_ID		0x00
++#define AW36413_REG_ENABLE		0x01
++#define AW36413_REG_IVFM		0x02
++#define AW36413_REG_FLASH_LVL(id)	(0x03 + (id))
++#define AW36413_REG_TORCH_LVL(id)	(0x05 + (id))
++#define AW36413_REG_BOOST		0x07
++#define AW36413_REG_TIMING		0x08
++#define AW36413_REG_TEMP		0x09
++#define AW36413_REG_FLAGS1		0x0a
++#define AW36413_REG_FLAGS2		0x0b
++#define AW36413_REG_DEV_ID		0x0c
++#define AW36413_REG_LAST_FLASH		0x0d
++
++#define AW36413_CHIP_ID			0x36
++
++/* ENABLE register: bits [1:0] LED enables, bits [3:2] mode */
++#define AW36413_ENABLE_LED_MASK		GENMASK(1, 0)
++#define AW36413_MODE_STANDBY		0x00
++#define AW36413_MODE_TORCH		(0x2 << 2)
++#define AW36413_MODE_FLASH		(0x3 << 2)
++
++/* TIMING register: bits [6:4] ramp time, bits [3:0] flash timeout */
++#define AW36413_TIMING_RAMP_1MS		(0x1 << 4)
++
++/* FLAGS1 bits (LM3644 family) */
++#define AW36413_FLAG1_TIMEOUT		BIT(0)
++#define AW36413_FLAG1_UVLO		BIT(1)
++#define AW36413_FLAG1_THERMAL		BIT(2)
++#define AW36413_FLAG1_LED1_SHORT	BIT(3)
++#define AW36413_FLAG1_LED2_SHORT	BIT(4)
++#define AW36413_FLAG1_CURR_LIMIT	BIT(5)
++/* FLAGS2 bits */
++#define AW36413_FLAG2_OVP		BIT(0)
++
++/*
++ * Torch current, vendor formula (variant at I2C address 0x6b):
++ * code = (100 * mA + 280) / 560 - 1, i.e. I = code * 5.6 mA + 2.8 mA.
++ * The downstream driver caps torch at 300 mA/LED (code 52).
++ */
++#define AW36413_TORCH_STEP_UA		5600
++#define AW36413_TORCH_MIN_UA		2800
++#define AW36413_TORCH_CODE_MAX		52
++
++/*
++ * Flash current, vendor formula:
++ * code = (100 * mA + 1170) / 2344 - 1, i.e. I = code * 23.44 mA + 11.74 mA.
++ * The downstream driver caps flash at 1500 mA/LED (code 63).
++ */
++#define AW36413_FLASH_STEP_UA		23440
++#define AW36413_FLASH_MIN_UA		11740
++#define AW36413_FLASH_CODE_MAX		63
++
++#define AW36413_TIMEOUT_MIN_US		10000
++#define AW36413_TIMEOUT_STEP_US		10000
++#define AW36413_TIMEOUT_MAX_US		400000
++
++/* The vendor driver waits 5 ms around every HWEN edge. */
++#define AW36413_HWEN_DELAY_US		5000
++
++struct aw36413;
++
++struct aw36413_led {
++	struct led_classdev_flash flash;
++	struct aw36413 *chip;
++	u8 led_mask;		/* bitmask of driven output channels */
++};
++
++struct aw36413 {
++	struct device *dev;
++	struct regmap *regmap;
++	struct mutex mutex;
++
++	struct gpio_desc *enable_gpio;
++	struct gpio_desc *strobe_gpio;
++
++	/* chip is powered (HWEN high) with the boost converter armed */
++	bool armed;
++
++	/* shadow of the level/timing registers, restored after each arm */
++	u8 torch_code[AW36413_MAX_LEDS];
++	u8 flash_code[AW36413_MAX_LEDS];
++	u8 timeout_code;
++
++	u8 torch_used;		/* channel bitmask currently in torch mode */
++	u8 strobe_used;		/* channel bitmask currently strobing */
++	u8 leds_active;		/* channels claimed by child nodes */
++	int num_leds;
++	struct aw36413_led leds[] __counted_by(num_leds);
++};
++
++static struct aw36413_led *lcdev_to_led(struct led_classdev *lcdev)
++{
++	return container_of(lcdev, struct aw36413_led, flash.led_cdev);
++}
++
++static struct aw36413_led *flcdev_to_led(struct led_classdev_flash *fl_cdev)
++{
++	return container_of(fl_cdev, struct aw36413_led, flash);
++}
++
++static u8 aw36413_timeout_to_code(u32 timeout_us)
++{
++	u32 ms = timeout_us / 1000;
++
++	/*
++	 * LM3644-family flash timeout table: codes 0-9 are 10..100 ms in
++	 * 10 ms steps, codes 10-15 are 150..400 ms in 50 ms steps. The
++	 * vendor driver always writes TIMING = 0x16 (ramp 1 ms, timeout
++	 * code 6) and comments it as "1000 ms" -- if the real AW36413
++	 * table differs, only the absolute timeout length is off, never
++	 * the safety direction of rounding down here.
++	 */
++	if (ms <= 10)
++		return 0;
++	if (ms <= 100)
++		return ms / 10 - 1;
++	return min_t(u32, 9 + (ms - 100) / 50, 15);
++}
++
++/*
++ * Power the chip up with a full HWEN OFF->ON cycle so the boost converter
++ * arms (see the comment at the top of this file), then restore all level
++ * registers, which were lost while HWEN was low. Must be called with the
++ * chip mutex held.
++ */
++static int aw36413_chip_arm(struct aw36413 *chip)
++{
++	int i, ret;
++
++	if (chip->armed)
++		return 0;
++
++	gpiod_set_value_cansleep(chip->enable_gpio, 0);
++	usleep_range(AW36413_HWEN_DELAY_US, AW36413_HWEN_DELAY_US + 500);
++	gpiod_set_value_cansleep(chip->enable_gpio, 1);
++	usleep_range(AW36413_HWEN_DELAY_US, AW36413_HWEN_DELAY_US + 500);
++
++	for (i = 0; i < AW36413_MAX_LEDS; i++) {
++		ret = regmap_write(chip->regmap, AW36413_REG_TORCH_LVL(i),
++				   chip->torch_code[i]);
++		if (ret)
++			return ret;
++
++		ret = regmap_write(chip->regmap, AW36413_REG_FLASH_LVL(i),
++				   chip->flash_code[i]);
++		if (ret)
++			return ret;
++	}
++
++	ret = regmap_write(chip->regmap, AW36413_REG_TIMING,
++			   AW36413_TIMING_RAMP_1MS | chip->timeout_code);
++	if (ret)
++		return ret;
++
++	chip->armed = true;
++	return 0;
++}
++
++/* Must be called with the chip mutex held. */
++static void aw36413_chip_disarm(struct aw36413 *chip)
++{
++	/* Best effort; dropping HWEN below resets the chip anyway. */
++	regmap_write(chip->regmap, AW36413_REG_ENABLE, AW36413_MODE_STANDBY);
++	gpiod_set_value_cansleep(chip->enable_gpio, 0);
++	chip->armed = false;
++}
++
++static int aw36413_torch_brightness_set(struct led_classdev *lcdev,
++					enum led_brightness brightness)
++{
++	struct aw36413_led *led = lcdev_to_led(lcdev);
++	struct aw36413 *chip = led->chip;
++	u8 new_torch;
++	int i, ret = 0;
++
++	mutex_lock(&chip->mutex);
++
++	if (chip->strobe_used) {
++		dev_warn(chip->dev,
++			 "Cannot set torch brightness whilst strobe is enabled\n");
++		ret = -EBUSY;
++		goto unlock;
++	}
++
++	if (brightness)
++		new_torch = chip->torch_used | led->led_mask;
++	else
++		new_torch = chip->torch_used & ~led->led_mask;
++
++	for (i = 0; i < AW36413_MAX_LEDS; i++)
++		if (led->led_mask & BIT(i))
++			chip->torch_code[i] = brightness ? brightness - 1 : 0;
++
++	if (!new_torch) {
++		aw36413_chip_disarm(chip);
++		chip->torch_used = 0;
++		goto unlock;
++	}
++
++	ret = aw36413_chip_arm(chip);
++	if (ret)
++		goto unlock;
++
++	for (i = 0; i < AW36413_MAX_LEDS; i++) {
++		if (!(led->led_mask & BIT(i)))
++			continue;
++
++		ret = regmap_write(chip->regmap, AW36413_REG_TORCH_LVL(i),
++				   chip->torch_code[i]);
++		if (ret)
++			goto unlock;
++	}
++
++	ret = regmap_write(chip->regmap, AW36413_REG_ENABLE,
++			   AW36413_MODE_TORCH | new_torch);
++	if (ret)
++		goto unlock;
++
++	chip->torch_used = new_torch;
++
++unlock:
++	mutex_unlock(&chip->mutex);
++	return ret;
++}
++
++static int aw36413_flash_brightness_set(struct led_classdev_flash *fl_cdev,
++					u32 brightness)
++{
++	struct aw36413_led *led = flcdev_to_led(fl_cdev);
++	struct led_flash_setting *s = &fl_cdev->brightness;
++	u8 code = (brightness - s->min) / s->step;
++	struct aw36413 *chip = led->chip;
++	int i, ret = 0;
++
++	mutex_lock(&chip->mutex);
++
++	for (i = 0; i < AW36413_MAX_LEDS; i++)
++		if (led->led_mask & BIT(i))
++			chip->flash_code[i] = code;
++
++	/*
++	 * While the chip is unpowered (HWEN low) the write is deferred to
++	 * strobe_set(), whose arm restores the level registers.
++	 */
++	if (!chip->armed)
++		goto unlock;
++
++	for (i = 0; i < AW36413_MAX_LEDS; i++) {
++		if (!(led->led_mask & BIT(i)))
++			continue;
++
++		ret = regmap_write(chip->regmap, AW36413_REG_FLASH_LVL(i),
++				   chip->flash_code[i]);
++		if (ret)
++			break;
++	}
++
++unlock:
++	mutex_unlock(&chip->mutex);
++	return ret;
++}
++
++static int aw36413_strobe_set(struct led_classdev_flash *fl_cdev, bool state)
++{
++	struct aw36413_led *led = flcdev_to_led(fl_cdev);
++	struct aw36413 *chip = led->chip;
++	u8 new_strobe;
++	int ret = 0;
++
++	mutex_lock(&chip->mutex);
++
++	if (chip->torch_used) {
++		dev_warn(chip->dev, "Cannot strobe whilst torch is enabled\n");
++		ret = -EBUSY;
++		goto unlock;
++	}
++
++	if (state)
++		new_strobe = chip->strobe_used | led->led_mask;
++	else
++		new_strobe = chip->strobe_used & ~led->led_mask;
++
++	if (!new_strobe) {
++		aw36413_chip_disarm(chip);
++		chip->strobe_used = 0;
++		goto unlock;
++	}
++
++	ret = aw36413_chip_arm(chip);
++	if (ret)
++		goto unlock;
++
++	/* The flash self-terminates after the TIMING register timeout. */
++	ret = regmap_write(chip->regmap, AW36413_REG_ENABLE,
++			   AW36413_MODE_FLASH | new_strobe);
++	if (ret)
++		goto unlock;
++
++	chip->strobe_used = new_strobe;
++
++unlock:
++	mutex_unlock(&chip->mutex);
++	return ret;
++}
++
++static int aw36413_strobe_get(struct led_classdev_flash *fl_cdev, bool *state)
++{
++	struct aw36413_led *led = flcdev_to_led(fl_cdev);
++	struct aw36413 *chip = led->chip;
++
++	mutex_lock(&chip->mutex);
++	*state = !!(chip->strobe_used & led->led_mask);
++	mutex_unlock(&chip->mutex);
++
++	return 0;
++}
++
++static int aw36413_timeout_set(struct led_classdev_flash *fl_cdev, u32 timeout)
++{
++	struct aw36413_led *led = flcdev_to_led(fl_cdev);
++	struct aw36413 *chip = led->chip;
++	int ret = 0;
++
++	mutex_lock(&chip->mutex);
++
++	chip->timeout_code = aw36413_timeout_to_code(timeout);
++	if (chip->armed)
++		ret = regmap_write(chip->regmap, AW36413_REG_TIMING,
++				   AW36413_TIMING_RAMP_1MS |
++				   chip->timeout_code);
++
++	mutex_unlock(&chip->mutex);
++	return ret;
++}
++
++static int aw36413_fault_get(struct led_classdev_flash *fl_cdev, u32 *fault)
++{
++	struct aw36413_led *led = flcdev_to_led(fl_cdev);
++	struct aw36413 *chip = led->chip;
++	u32 flags1, flags2, led_faults = 0;
++	int ret;
++
++	mutex_lock(&chip->mutex);
++
++	/* Unpowered: the fault registers were reset along with the core. */
++	if (!chip->armed) {
++		mutex_unlock(&chip->mutex);
++		*fault = 0;
++		return 0;
++	}
++
++	/* NOTE: reading the flag registers clears them */
++	ret = regmap_read(chip->regmap, AW36413_REG_FLAGS1, &flags1);
++	if (!ret)
++		ret = regmap_read(chip->regmap, AW36413_REG_FLAGS2, &flags2);
++
++	mutex_unlock(&chip->mutex);
++
++	if (ret)
++		return ret;
++
++	if (flags1 & AW36413_FLAG1_TIMEOUT)
++		led_faults |= LED_FAULT_TIMEOUT;
++
++	if (flags1 & AW36413_FLAG1_UVLO)
++		led_faults |= LED_FAULT_UNDER_VOLTAGE;
++
++	if (flags1 & AW36413_FLAG1_THERMAL)
++		led_faults |= LED_FAULT_OVER_TEMPERATURE;
++
++	if (flags1 & (AW36413_FLAG1_LED1_SHORT | AW36413_FLAG1_LED2_SHORT))
++		led_faults |= LED_FAULT_SHORT_CIRCUIT;
++
++	if (flags1 & AW36413_FLAG1_CURR_LIMIT)
++		led_faults |= LED_FAULT_OVER_CURRENT;
++
++	if (flags2 & AW36413_FLAG2_OVP)
++		led_faults |= LED_FAULT_OVER_VOLTAGE;
++
++	*fault = led_faults;
++	return 0;
++}
++
++static const struct led_flash_ops aw36413_flash_ops = {
++	.flash_brightness_set = aw36413_flash_brightness_set,
++	.strobe_set = aw36413_strobe_set,
++	.strobe_get = aw36413_strobe_get,
++	.timeout_set = aw36413_timeout_set,
++	.fault_get = aw36413_fault_get,
++};
++
++static int aw36413_init_flash_properties(struct aw36413 *chip,
++					 struct aw36413_led *led,
++					 struct device_node *np)
++{
++	struct led_classdev_flash *flash = &led->flash;
++	struct led_classdev *lcdev = &flash->led_cdev;
++	u32 sources[AW36413_MAX_LEDS];
++	u32 torch_max_ua, flash_max_ua, timeout_us;
++	struct led_flash_setting *s;
++	int i, num, ret;
++
++	num = of_property_count_u32_elems(np, "led-sources");
++	if (num < 1 || num > AW36413_MAX_LEDS) {
++		dev_err(chip->dev,
++			"Not specified or wrong number of led-sources\n");
++		return -EINVAL;
++	}
++
++	ret = of_property_read_u32_array(np, "led-sources", sources, num);
++	if (ret)
++		return ret;
++
++	for (i = 0; i < num; i++) {
++		if (sources[i] >= AW36413_MAX_LEDS)
++			return -EINVAL;
++		if (chip->leds_active & BIT(sources[i]))
++			return -EINVAL;
++		chip->leds_active |= BIT(sources[i]);
++		led->led_mask |= BIT(sources[i]);
++	}
++
++	torch_max_ua = AW36413_TORCH_MIN_UA +
++		       AW36413_TORCH_CODE_MAX * AW36413_TORCH_STEP_UA;
++	of_property_read_u32(np, "led-max-microamp", &torch_max_ua);
++	torch_max_ua = clamp_t(u32, torch_max_ua, AW36413_TORCH_MIN_UA,
++			       AW36413_TORCH_MIN_UA +
++			       AW36413_TORCH_CODE_MAX * AW36413_TORCH_STEP_UA);
++
++	/* brightness b maps to torch level code b - 1 */
++	lcdev->max_brightness = (torch_max_ua - AW36413_TORCH_MIN_UA) /
++				AW36413_TORCH_STEP_UA + 1;
++	lcdev->brightness_set_blocking = aw36413_torch_brightness_set;
++	lcdev->flags |= LED_DEV_CAP_FLASH;
++
++	flash_max_ua = AW36413_FLASH_MIN_UA +
++		       AW36413_FLASH_CODE_MAX * AW36413_FLASH_STEP_UA;
++	of_property_read_u32(np, "flash-max-microamp", &flash_max_ua);
++	flash_max_ua = clamp_t(u32, flash_max_ua, AW36413_FLASH_MIN_UA,
++			       AW36413_FLASH_MIN_UA +
++			       AW36413_FLASH_CODE_MAX * AW36413_FLASH_STEP_UA);
++
++	s = &flash->brightness;
++	s->min = AW36413_FLASH_MIN_UA;
++	s->step = AW36413_FLASH_STEP_UA;
++	s->max = s->min + (flash_max_ua - s->min) / s->step * s->step;
++	s->val = s->max;
++
++	timeout_us = AW36413_TIMEOUT_MAX_US;
++	of_property_read_u32(np, "flash-max-timeout-us", &timeout_us);
++	timeout_us = clamp_t(u32, timeout_us, AW36413_TIMEOUT_MIN_US,
++			     AW36413_TIMEOUT_MAX_US);
++
++	s = &flash->timeout;
++	s->min = AW36413_TIMEOUT_MIN_US;
++	s->step = AW36413_TIMEOUT_STEP_US;
++	s->max = timeout_us;
++	s->val = timeout_us;
++	chip->timeout_code = aw36413_timeout_to_code(timeout_us);
++
++	flash->ops = &aw36413_flash_ops;
++
++	return 0;
++}
++
++static int aw36413_led_register(struct aw36413 *chip, struct aw36413_led *led,
++				struct device_node *np)
++{
++	struct led_init_data init_data = {};
++	int ret;
++
++	init_data.fwnode = of_fwnode_handle(np);
++
++	ret = devm_led_classdev_flash_register_ext(chip->dev, &led->flash,
++						   &init_data);
++	if (ret)
++		dev_err(chip->dev, "Couldn't register flash LED %#x\n",
++			led->led_mask);
++
++	return ret;
++}
++
++static int aw36413_probe_dt(struct aw36413 *chip)
++{
++	struct device_node *np = dev_of_node(chip->dev);
++	int child_num = 0;
++	int ret;
++
++	for_each_available_child_of_node_scoped(np, child) {
++		struct aw36413_led *led = chip->leds + child_num;
++
++		led->chip = chip;
++
++		ret = aw36413_init_flash_properties(chip, led, child);
++		if (ret)
++			return ret;
++
++		ret = aw36413_led_register(chip, led, child);
++		if (ret)
++			return ret;
++
++		child_num++;
++	}
++
++	return 0;
++}
++
++static int aw36413_chip_check(struct aw36413 *chip)
++{
++	u32 chip_id, dev_id;
++	int ret;
++
++	/* The chip only answers on I2C after a HWEN rising edge. */
++	ret = aw36413_chip_arm(chip);
++	if (ret) {
++		aw36413_chip_disarm(chip);
++		return dev_err_probe(chip->dev, ret, "Failed to power up\n");
++	}
++
++	ret = regmap_read(chip->regmap, AW36413_REG_CHIP_ID, &chip_id);
++	if (ret) {
++		aw36413_chip_disarm(chip);
++		return dev_err_probe(chip->dev, ret,
++				     "Failed to read chip ID\n");
++	}
++
++	ret = regmap_read(chip->regmap, AW36413_REG_DEV_ID, &dev_id);
++	if (ret)
++		dev_id = 0;
++
++	/*
++	 * The m1721 unit answers 0x36/0x12; the alternate-vendor variant
++	 * (at I2C address 0x63) reports device ID 0x1c. Only warn, since
++	 * the register interface is the same.
++	 */
++	if (chip_id != AW36413_CHIP_ID)
++		dev_warn(chip->dev,
++			 "Unexpected chip ID %#x (device ID %#x), continuing\n",
++			 chip_id, dev_id);
++	else
++		dev_info(chip->dev, "chip ID %#x, device ID %#x\n",
++			 chip_id, dev_id);
++
++	aw36413_chip_disarm(chip);
++	return 0;
++}
++
++static const struct regmap_config aw36413_regmap_config = {
++	.reg_bits = 8,
++	.val_bits = 8,
++	.max_register = AW36413_REG_LAST_FLASH,
++	/* no cache: HWEN power cycles reset the chip behind regmap's back */
++};
++
++static int aw36413_probe(struct i2c_client *client)
++{
++	struct device *dev = &client->dev;
++	struct aw36413 *chip;
++	size_t count;
++	int ret;
++
++	count = device_get_child_node_count(dev);
++	if (!count || count > AW36413_MAX_LEDS)
++		return dev_err_probe(dev, -EINVAL,
++				     "Invalid amount of LED nodes %zu\n",
++				     count);
++
++	chip = devm_kzalloc(dev, struct_size(chip, leds, count), GFP_KERNEL);
++	if (!chip)
++		return -ENOMEM;
++
++	chip->num_leds = count;
++	chip->dev = dev;
++	i2c_set_clientdata(client, chip);
++
++	/* Keep HWEN low while idle so an enable makes a fresh rising edge. */
++	chip->enable_gpio = devm_gpiod_get(dev, "enable", GPIOD_OUT_LOW);
++	ret = PTR_ERR_OR_ZERO(chip->enable_gpio);
++	if (ret)
++		return dev_err_probe(dev, ret,
++				     "Failed to request enable gpio\n");
++
++	/* Hardware strobe input, unused (flash fires over I2C); park low. */
++	chip->strobe_gpio = devm_gpiod_get_optional(dev, "strobe",
++						    GPIOD_OUT_LOW);
++	ret = PTR_ERR_OR_ZERO(chip->strobe_gpio);
++	if (ret)
++		return dev_err_probe(dev, ret,
++				     "Failed to request strobe gpio\n");
++
++	ret = devm_mutex_init(dev, &chip->mutex);
++	if (ret)
++		return ret;
++
++	chip->regmap = devm_regmap_init_i2c(client, &aw36413_regmap_config);
++	if (IS_ERR(chip->regmap))
++		return dev_err_probe(dev, PTR_ERR(chip->regmap),
++				     "Failed to allocate register map\n");
++
++	mutex_lock(&chip->mutex);
++	ret = aw36413_chip_check(chip);
++	mutex_unlock(&chip->mutex);
++	if (ret)
++		return ret;
++
++	return aw36413_probe_dt(chip);
++}
++
++static void aw36413_shutdown(struct i2c_client *client)
++{
++	struct aw36413 *chip = i2c_get_clientdata(client);
++
++	mutex_lock(&chip->mutex);
++	aw36413_chip_disarm(chip);
++	mutex_unlock(&chip->mutex);
++}
++
++static const struct i2c_device_id aw36413_id[] = {
++	{ "aw36413" },
++	{}
++};
++MODULE_DEVICE_TABLE(i2c, aw36413_id);
++
++static const struct of_device_id aw36413_leds_match[] = {
++	{ .compatible = "awinic,aw36413" },
++	{}
++};
++MODULE_DEVICE_TABLE(of, aw36413_leds_match);
++
++static struct i2c_driver aw36413_driver = {
++	.driver = {
++		.name = "aw36413",
++		.of_match_table = aw36413_leds_match,
++	},
++	.probe = aw36413_probe,
++	.shutdown = aw36413_shutdown,
++	.id_table = aw36413_id,
++};
++module_i2c_driver(aw36413_driver);
++
++MODULE_AUTHOR("nomorecoolnicknames <78512247+nomorecoolnicknames@users.noreply.github.com>");
++MODULE_DESCRIPTION("Awinic AW36413 dual-channel flash LED driver");
++MODULE_LICENSE("GPL");
+-- 
+2.39.5
+

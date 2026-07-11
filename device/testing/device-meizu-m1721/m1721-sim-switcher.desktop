@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=SIM
+Name[ru]=SIM
+Comment=Switch the active SIM card
+Comment[ru]=Переключить активную SIM-карту
+Icon=network-cellular-symbolic
+Exec=sim-switcher
+Terminal=false
+Categories=Settings;System;

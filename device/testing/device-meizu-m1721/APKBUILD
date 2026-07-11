@@ -1,0 +1,150 @@
+# Reference: <https://postmarketos.org/devicepkg>
+pkgname=device-meizu-m1721
+pkgdesc="Meizu M6 Note"
+pkgver=1
+pkgrel=32
+url="https://postmarketos.org"
+license="MIT"
+arch="aarch64"
+options="!check !archcheck"
+install="$pkgname.post-install"
+depends="
+	firmware-meizu-m1721
+	firmware-qcom-adreno-a530
+	linux-postmarketos-qcom-msm8953
+	lk2nd-msm8953
+	mkbootimg
+	msm-firmware-loader
+	postmarketos-base
+	i2c-tools
+	soc-qcom-msm8953
+	soc-qcom-msm8953-modem
+	py3-gobject3
+	gtk4.0
+	libadwaita
+"
+makedepends="devicepkg-dev"
+source="
+	deviceinfo
+	modules-initfs
+	$pkgname.post-install
+	00-m1721-logdump.sh
+	00-m1721-gpu-firmware.files
+	m1721-diag.start
+	ucm2-meizu-m1721.conf
+	ucm2-HiFi.conf
+	ucm2-VoiceCall.conf
+	libcamera-imx362.yaml
+	libcamera-s5k3p8sp.yaml
+	megapixels-meizu-m1721.conf
+	gps
+	batmon
+	batmon.initd
+	50-modem-up.start
+	sim-select
+	sim-switcher.py
+	m1721-sim-switcher.desktop
+	torch
+	90-m1721-modemmanager-voice.rules
+	91-m1721-sim-select.rules
+"
+
+build() {
+	devicepkg_build $startdir $pkgname
+}
+
+package() {
+	devicepkg_package $startdir $pkgname
+
+	# bring-up only: initramfs hook dumping dmesg into the expendable
+	# 'logdump' partition so boot logs survive without UART/USB
+	install -Dm644 "$srcdir"/00-m1721-logdump.sh \
+		-t "$pkgdir"/usr/share/mkinitfs/hooks/
+
+	# pull the Adreno 506 microcode + zap shader into the initramfs so the
+	# GPU comes up in early boot; otherwise the fw only loads from the rootfs
+	# (~200s in) after phoc has already fallen back to software rendering
+	install -Dm644 "$srcdir"/00-m1721-gpu-firmware.files \
+		-t "$pkgdir"/usr/share/mkinitfs/files/
+
+	# bring-up only: late-boot diagnostic collector run by the OpenRC 'local'
+	# service; snapshots net/charger/sensor state into the logdump partition
+	# every 10s so it is readable from TWRP even when on-device ssh is dead
+	install -Dm755 "$srcdir"/m1721-diag.start \
+		"$pkgdir"/etc/local.d/m1721-diag.start
+
+	# ALSA UCM: HiFi verb (WCD earpiece/headphones/mics on PRI_MI2S + Cirrus
+	# CS35L35 boosted speaker on QUAT_MI2S). Verified live on-device; the
+	# speaker is the phosh default output. See SOUND_CS35L35_ROUTING.md in the
+	# port docs.
+	install -Dm644 "$srcdir"/ucm2-meizu-m1721.conf \
+		"$pkgdir"/usr/share/alsa/ucm2/conf.d/meizu-m1721/meizu-m1721.conf
+	install -Dm644 "$srcdir"/ucm2-HiFi.conf \
+		"$pkgdir"/usr/share/alsa/ucm2/Meizu/m1721/HiFi.conf
+	install -Dm644 "$srcdir"/ucm2-VoiceCall.conf \
+		"$pkgdir"/usr/share/alsa/ucm2/Meizu/m1721/VoiceCall.conf
+
+	# libcamera simple/SoftISP tuning: pinned black level (disables the
+	# drifting histogram auto-guess) for both sensors
+	install -Dm644 "$srcdir"/libcamera-imx362.yaml \
+		"$pkgdir"/etc/libcamera/ipa/simple/imx362.yaml
+	install -Dm644 "$srcdir"/libcamera-s5k3p8sp.yaml \
+		"$pkgdir"/etc/libcamera/ipa/simple/s5k3p8sp.yaml
+
+	# Megapixels/libmegapixels device config (rear imx362 via qcom-camss);
+	# matched by DT compatible "meizu,m1721"
+	install -Dm644 "$srcdir"/megapixels-meizu-m1721.conf \
+		"$pkgdir"/usr/share/megapixels/config/meizu,m1721.conf
+
+	# late-modem ModemManager kick (OpenRC 'local'). GNSS is NOT auto-enabled
+	# anymore (a permanently-searching GPS drains + heats); use the gps toggle.
+	install -Dm755 "$srcdir"/gps "$pkgdir"/usr/bin/gps
+	install -Dm755 "$srcdir"/50-modem-up.start \
+		"$pkgdir"/etc/local.d/50-modem-up.start
+
+	# battery monitor / power-hog sampler (batmon report)
+	install -Dm755 "$srcdir"/batmon "$pkgdir"/usr/bin/batmon
+	install -Dm755 "$srcdir"/batmon.initd "$pkgdir"/etc/init.d/batmon
+
+	# small userspace helpers: runtime SIM-slot switch (QMI UIM provisioning)
+	# and rear-flash torch (AW36413); both need root
+	install -Dm755 "$srcdir"/sim-select "$pkgdir"/usr/bin/sim-select
+	install -Dm755 "$srcdir"/torch "$pkgdir"/usr/bin/torch
+
+	# GUI SIM switching: one consolidated Adwaita app (not two bare icons)
+	install -Dm755 "$srcdir"/sim-switcher.py "$pkgdir"/usr/bin/sim-switcher
+	install -Dm644 "$srcdir"/m1721-sim-switcher.desktop \
+		-t "$pkgdir"/usr/share/applications/
+
+	# polkit: pmOS grants plugdev Device.Control/Contacts/Messaging/Location
+	# but NOT Voice -> gnome-calls accept/hangup fail Unauthorized. Grant it.
+	install -Dm644 "$srcdir"/90-m1721-modemmanager-voice.rules \
+		"$pkgdir"/etc/polkit-1/rules.d/90-m1721-modemmanager-voice.rules
+	install -Dm644 "$srcdir"/91-m1721-sim-select.rules \
+		"$pkgdir"/etc/polkit-1/rules.d/91-m1721-sim-select.rules
+}
+
+sha512sums="
+b175ce6043a4641c89b6e9c466125e1ab8a1f4d938a16f04bdf82a0f488300fc68e97b4a0018971684d757d7a90198e4445aa37b8396529a3b3c613d2a06f2d7  deviceinfo
+5ea382577b3da7b588138f42e980f31dccdf7c5be8902ea5ef2c12d5632a81f9eff469c0c12b3ce58de2bf38454983f0e12d59b706bcfefbb84752a9b12334c4  modules-initfs
+8fe1a80dc5a59d9323b4bea9dcbaf9cde015f68500825e88b631350353459e1c601c7861bbb24b6f50c057e0dd514ba7bd69efa77515e89806e88832873e5eb9  device-meizu-m1721.post-install
+b8d66d486a7a7d564c47ac41123b80823b475c569aaa530dd154a4f42a4c0bd5546c3f17eb968daef968672a50e5ead2fce262097296eabf114a91f56d917950  00-m1721-logdump.sh
+c786ff8b58be04bc137b8e51d036a59b5508fe054ae0545011df7d0358405d4e28969d88bedca4a78450fdb393c51d9060b5349a61e435a801133130bf47054b  00-m1721-gpu-firmware.files
+ba85ca81cc1bcf111dd341c341c7434d19c602f6e3f9f678a3bc482bbe4bb2674eb95bfc5173c7ec24603e466a0378b21d12144fb7dcdf4a63dc8e4c35c248e5  m1721-diag.start
+d102b45a98526c73bcf12e498f60ad8f57bacb71ea93f56d01cd7d43a234053896a413eb9b52b78ec630f29f2ae51ec3c251e1caab8f58b81efbf489347e2778  ucm2-meizu-m1721.conf
+f140c343a804499df8b290008ba5f4bee73114b1dc69b486abd69470f88cfaca5692c059e3f43736ae9d47b31b41467fddc599b86f258b71fc30c5f924065fba  ucm2-HiFi.conf
+5e1f00f400395cf1b22fd243baa292acbf72cdc6a97b447c58f6d3e9b0b2bd62b617def077f9c1414fb38a36eb155667dae84c2ede5f59bbbb1468fefaf3ee90  ucm2-VoiceCall.conf
+27ac73cdd7965dec1c140cafa72409defcd4dd40db7c3b05822f3c95122240a6d46fb7c5767360b7fd7a8b268116fc99914899da6522b409da3e1ee6d0d0b4df  libcamera-imx362.yaml
+0fdf36c10a6572364b0aa45cc300dea8a2fe0456c6e22b34471814556c65302b02c6d11b96dfd547492e2822ea697ad5b2e0c87f433e63ce3d35ec109ef28003  libcamera-s5k3p8sp.yaml
+011ae6b8d1284a8d90372680d438d68ccd998a2b7b227effad510c0904103a1febc63ed2d7424d76a87ec247fd1b0188b08a7579a75618a8a9b2a6d4b19556eb  megapixels-meizu-m1721.conf
+99275f9cf37d84840cc5d436898fe35672bec6eb3e60568215761bd9826a6c9f047eeab46d2743ebfe8d52378fd3405d978c1d4f2669d4b19496812d2c004fb3  gps
+24bd6412bf9165fcbe4a96034c957a05c7e596736a3f0ad594e4c6648587e332a126c9bcd0d7016c9ec6496aa96008c5097f2fa50454965a90903200bb74fca3  batmon
+21b34613de46b59ee2243fb81edfc685f0ecab4ead235578c185e42affad84308f2e795b5824c3b4f09d9f4db71b75f7cd7523633828cd9e2736ec4b00a5ec43  batmon.initd
+aa834d7b424a2112e2c32dd1606d2617a3c73361f3965a8dcf6bf88a09048750369239afb9b84294d48e9dd35e7a448ee9a65e55f074c6e5f0acf02e845f25ea  50-modem-up.start
+0917b5b2e2652713f489ae8aceb0e7359a33f99bd4bfb86c944bd1d24c1c3b2ec7476d888ad842e8ca2bf4af993c9499f14d231b7ebfe42fa7f7b70cf6f29f2b  sim-select
+fcdca88b8f2aaf5568cf12f7500ea2ce5c2d70239b6229b4b07f6a26af75ae87088d27febbc992d010558333fdf60e7fdac9e0ece3b357a86d241fab4fde0582  sim-switcher.py
+af4005f77e51d3af101e1a8c48c93166a8979e7d8918eba4764926d2c6687d13a2b12f620ff6bb0be33db4dd380612a242e9a8e32f05c7eac38e4cd2b0a091b4  m1721-sim-switcher.desktop
+e18119cc44fad63ddc2f4b956dbabad51402a680d018aff93ff37937a0ddfb82c37940589aecbcc1d3df7f40bcd49d8018db25120ba850dd030ab5b0583a214d  torch
+888326d32523f341b43e10052d70237a1e11717d22373ba0d9a070fbc8e94cca46f7eb644976311d4bab82cc823ecfbb87978324807bf26ae24c61f6a7cbf58b  90-m1721-modemmanager-voice.rules
+145767c66b81dfd7fcb6c1dc44d9cbf7bf1aca418ce68efd75a6d295e1a344d2a65af21c09f0ebfb2702ab90c7cace15db7a15a14851b28b96c12bf29205d363  91-m1721-sim-select.rules
+"

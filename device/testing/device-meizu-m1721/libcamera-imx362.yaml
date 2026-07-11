@@ -1,0 +1,37 @@
+# SPDX-License-Identifier: CC0-1.0
+#
+# libcamera simple/SoftISP IPA tuning for Sony IMX362 (IMX260-class)
+# (Meizu M6 Note m1721 rear camera, 12.2 MP dual-pixel, SGRBG10,
+# 4032x3024 full / 2016x1512 binned).
+#
+# Deploy to (first match wins):
+#   /etc/libcamera/ipa/simple/imx362.yaml          (preferred, upgrade-safe)
+#   /usr/share/libcamera/ipa/simple/imx362.yaml
+#
+# Modeled on the shipped simple-IPA tuning for the sibling sensor imx363.yaml
+# (blackLevel: 4096 + Awb + Adjust + Agc).  blackLevel is on a 16-bit scale:
+# 4096 = 64 at 10 bits, the Sony IMX2xx pedestal (imx214/imx258 helpers use
+# the same value).  Pinning it disables the blc.cpp histogram auto-guess.
+#
+# NOTE: the Agc algorithm of the simple IPA has no tuning-file parameters in
+# this libcamera version; the gain model comes from the CameraSensorHelper
+# (see 0001-libipa-camera_sensor_helper-*.patch: gain = 512/(512-code),
+# code 0..480 = 1x..16x).
+%YAML 1.1
+---
+version: 1
+algorithms:
+  - BlackLevel:
+      blackLevel: 4096
+  - Awb:
+  # Color correction matrix: enable only with a measured matrix, CCM is
+  # CPU-expensive with SoftISP on msm8953:
+  # - Ccm:
+  #     ccms:
+  #       - ct: 6500
+  #         ccm: [ 1, 0, 0,
+  #                0, 1, 0,
+  #                0, 0, 1]
+  - Adjust:
+  - Agc:
+...

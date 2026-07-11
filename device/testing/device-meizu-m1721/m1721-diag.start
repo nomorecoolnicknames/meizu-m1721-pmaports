@@ -1,0 +1,71 @@
+#!/bin/sh
+# m1721 bring-up only: late-boot diagnostic dumper.
+#
+# The initramfs 00-m1721-logdump.sh hook dies at switch_root and only captures
+# early dmesg. Network / charger / sensor drivers probe LATER in the real
+# rootfs, and on-device ssh has proven unreliable under the software-render
+# CPU load. So this OpenRC local.d service backgrounds a collector that, once
+# userspace has settled, writes a full plaintext snapshot into the expendable
+# 'logdump' partition every 10s. Read it from TWRP with:
+#   dd if=/dev/block/mmcblk0p48 bs=1M count=1 | strings | less
+# Remove this before any daily-driver use.
+
+LOGDEV=/dev/disk/by-partlabel/logdump
+[ -b "$LOGDEV" ] || LOGDEV=/dev/mmcblk0p48
+[ -b "$LOGDEV" ] || exit 0
+
+# IMPORTANT: fully detach the collector. An OpenRC local.d script must return
+# promptly; a backgrounded loop that keeps stdin/stdout/stderr attached makes
+# the 'local' service block waiting on those fds and stalls the whole boot
+# (this bit us on the r10 flash — sshd never came up). Redirecting all three
+# fds to /dev/null lets 'local' complete cleanly; setsid puts the loop in its
+# own session so nothing supervises it.
+(
+	# let wcnss/adsp firmware, fg, NetworkManager and the sensor bus settle
+	sleep 45
+	i=0
+	while true; do
+		{
+			echo "=== PMOS-M1721-DIAG seq=$i uptime=$(cut -d' ' -f1 /proc/uptime) load=$(cut -d' ' -f1-3 /proc/loadavg) ==="
+			echo "--- meminfo ---"
+			head -3 /proc/meminfo 2>/dev/null
+
+			echo "--- POWER_SUPPLY ---"
+			for p in /sys/class/power_supply/*; do
+				[ -e "$p/uevent" ] || continue
+				echo "## $(basename "$p")"
+				cat "$p/uevent" 2>/dev/null
+			done
+
+			echo "--- NET ifaces ---"
+			ip -br link 2>/dev/null
+			ip -br addr 2>/dev/null
+			echo "--- rfkill ---"; rfkill list 2>/dev/null
+			echo "--- nmcli ---"; nmcli -t g 2>/dev/null; nmcli -t radio 2>/dev/null; nmcli -t dev 2>/dev/null
+			echo "--- services ---"; rc-status -a 2>/dev/null | grep -iE "networkmanager|wpa|blue|modem|eg25"
+			echo "--- bluetooth ---"; ls /sys/class/bluetooth/ 2>/dev/null
+
+			echo "--- I2C buses ---"; i2cdetect -l 2>/dev/null
+			BUS=$(i2cdetect -l 2>/dev/null | grep -i "i2c-gpio" | head -1 | sed -E 's/^i2c-([0-9]+).*/\1/')
+			if [ -n "$BUS" ]; then
+				echo "--- i2cdetect -y -r $BUS (sensor bitbang bus) ---"
+				i2cdetect -y -r "$BUS" 2>/dev/null
+			fi
+			echo "--- IIO devices ---"; for d in /sys/bus/iio/devices/*; do [ -e "$d/name" ] && echo "$(basename "$d"): $(cat "$d/name")"; done 2>/dev/null
+			echo "--- i2c bound devices ---"; ls /sys/bus/i2c/devices/ 2>/dev/null
+
+			echo "--- dmesg: net (wcn/wlan/bt) ---"
+			dmesg 2>/dev/null | grep -iE "wcn|pronto|wlan|wcnss|bluetooth|hci|qcom_wcnss|firmware" | tail -40
+			echo "--- dmesg: charger/fg ---"
+			dmesg 2>/dev/null | grep -iE "pmi8950|qpnp|smbchg|smb|fuel|fg |charg|battery|bms|vbus" | tail -40
+			echo "--- dmesg: sensors ---"
+			dmesg 2>/dev/null | grep -iE "bmi160|ak09911|ak8975|ltr50|ltr55|i2c-gpio|iio|magn|accel|gyro|light|prox" | tail -30
+			echo "--- dmesg: tail ---"
+			dmesg 2>/dev/null | tail -c 200000
+			echo "=== PMOS-M1721-DIAG-END seq=$i ==="
+		} > "$LOGDEV" 2>/dev/null
+		sync
+		i=$((i + 1))
+		sleep 10
+	done
+) </dev/null >/dev/null 2>&1 &

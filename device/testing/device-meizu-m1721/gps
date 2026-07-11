@@ -1,0 +1,10 @@
+#!/bin/sh
+# gps <on|off|status> — toggle the m1721 modem GNSS engine (NMEA+raw).
+# Left OFF by default: a permanently-running GNSS search (esp. indoors)
+# costs battery and heats the modem. geoclue/apps can still use it: gps on.
+case "${1:-status}" in
+on)  mmcli -m any --location-enable-gps-nmea --location-enable-gps-raw ;;
+off) mmcli -m any --location-disable-gps-nmea --location-disable-gps-raw ;;
+status) mmcli -m any --location-status ;;
+*) echo "usage: gps <on|off|status>"; exit 1 ;;
+esac

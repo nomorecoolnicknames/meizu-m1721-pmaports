@@ -1,0 +1,127 @@
+From 08836ebc1ac8bd93f5583d716276a155a4af2b47 Mon Sep 17 00:00:00 2001
+From: nomorecoolnicknames <78512247+nomorecoolnicknames@users.noreply.github.com>
+Date: Fri, 10 Jul 2026 14:19:17 -0500
+Subject: [PATCH] ASoC: qdsp6: q6voice: re-create CVP session on in-call device
+ switch
+
+The CVP session captures its tx/rx AFE port ids once, in
+q6voice_path_start() -> q6cvp_session_create()
+(VSS_IVOCPROC_CMD_CREATE_FULL_CONTROL_SESSION_V2); q6cvp implements no
+"set device" command. q6voice_put_mixer() -> q6voice_set_port() only
+stores the new port index, so flipping a "*_RX Voice Mixer VoiceMMode1"
+kcontrol during an active call updates DAPM/DPCM (the new back-end DAI
+is started, clocked and powered via snd_soc_dapm_mixer_update_power()
+-> snd_soc_dpcm_runtime_update()) but the vocoder keeps streaming to
+the port that was routed when the call started. The new back-end plays
+digital silence.
+
+Observed on the Meizu M6 Note (m1721, MSM8953): switching the downlink
+from PRI_MI2S_RX (WCD earpiece, routed at call start) to QUAT_MI2S_RX
+(CS35L35 speaker amp) mid-call leaves the amp powered but silent.
+
+When a port changes while the path is fully started, tear down the
+running CVP leg (stop voice, detach, disable, destroy the CVP session)
+and run q6voice_path_start() again so a new CVP session is created
+with the current ports and re-attached to the kept MVM session.
+Clearing a port (the old mixer switching off) is not treated as a
+switch; the running session is kept until a new port is set, which
+makes the fix independent of the enable/disable ordering of UCM
+sequences.
+
+q6voice_set_port() now takes the path mutex like q6voice_start()/
+q6voice_stop(); it is called from kcontrol put context where the ~7
+blocking APR commands (<300 ms timeout each) are acceptable and match
+what the downstream voc_set_device() flow does.
+
+Signed-off-by: nomorecoolnicknames <78512247+nomorecoolnicknames@users.noreply.github.com>
+Assisted-by: Claude (Anthropic)
+---
+ sound/soc/qcom/qdsp6/q6voice.c | 64 +++++++++++++++++++++++++++++++---
+ 1 file changed, 60 insertions(+), 4 deletions(-)
+
+diff --git a/sound/soc/qcom/qdsp6/q6voice.c b/sound/soc/qcom/qdsp6/q6voice.c
+index d5751905a..4e6f50ba0 100644
+--- a/sound/soc/qcom/qdsp6/q6voice.c
++++ b/sound/soc/qcom/qdsp6/q6voice.c
+@@ -88,6 +88,46 @@ static int q6voice_path_start(struct q6voice_path *p)
+ 	return ret;
+ }
+ 
++/*
++ * The CVP session is bound to the AFE ports that p->tx_port/p->rx_port held
++ * when q6voice_path_start() created it (CVP has no "set device" command in
++ * this driver, only CREATE_FULL_CONTROL_SESSION_V2). To make an in-call
++ * device switch (e.g. earpiece -> speakerphone) take effect on the DSP, tear
++ * down the running CVP leg and bring the path back up so a new CVP session
++ * is created with the current ports. The MVM session is kept.
++ */
++static int q6voice_path_switch_port(struct q6voice_path *p)
++{
++	struct device *dev = p->v->dev;
++	struct q6voice_session *mvm = p->runtime->sessions[Q6VOICE_SERVICE_MVM];
++	struct q6voice_session *cvp = p->runtime->sessions[Q6VOICE_SERVICE_CVP];
++	int ret;
++
++	dev_dbg(dev, "switch path %d to tx port %d, rx port %d\n",
++		p->type, p->tx_port, p->rx_port);
++
++	ret = q6mvm_start(mvm, false);
++	if (ret)
++		dev_err(dev, "failed to stop voice: %d\n", ret);
++
++	ret = q6mvm_attach(mvm, cvp, false);
++	if (ret)
++		dev_err(dev, "failed to detach cvp from mvm: %d\n", ret);
++
++	ret = q6cvp_enable(cvp, false);
++	if (ret)
++		dev_err(dev, "failed to disable cvp: %d\n", ret);
++
++	q6voice_session_release(cvp);
++	p->runtime->sessions[Q6VOICE_SERVICE_CVP] = NULL;
++
++	ret = q6voice_path_start(p);
++	if (ret)
++		dev_err(dev, "failed to restart path %d on new ports: %d\n",
++			p->type, ret);
++	return ret;
++}
++
+ int q6voice_start(struct q6voice *v, enum q6voice_path_type path, bool capture)
+ {
+ 	struct q6voice_path *p = &v->paths[path];
+@@ -252,11 +292,27 @@ void q6voice_set_port(struct q6voice *v, enum q6voice_path_type path,
+ 		      bool capture, int index)
+ {
+ 	struct q6voice_path *p = &v->paths[path];
++	int *port = capture ? &p->tx_port : &p->rx_port;
+ 
+-	if (capture)
+-		p->tx_port = index;
+-	else
+-		p->rx_port = index;
++	mutex_lock(&p->lock);
++	if (*port == index)
++		goto out;
++
++	*port = index;
++
++	/*
++	 * If the path is already running, the routing mixer was flipped in
++	 * the middle of a call: re-create the CVP session so the vocoder
++	 * actually moves to the new AFE port. Clearing a port (index 0, the
++	 * old mixer switching off) is not a device switch - keep the running
++	 * session until a new port is set.
++	 */
++	if (index > 0 && p->runtime && p->runtime->started == 3 &&
++	    p->tx_port > 0 && p->rx_port > 0)
++		q6voice_path_switch_port(p);
++
++out:
++	mutex_unlock(&p->lock);
+ }
+ EXPORT_SYMBOL_GPL(q6voice_set_port);
+ 
+-- 
+2.39.5
+

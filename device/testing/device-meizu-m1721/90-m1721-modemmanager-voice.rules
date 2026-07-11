@@ -1,0 +1,13 @@
+// m1721: pmOS's 01-org.freedesktop.ModemManager.rules grants plugdev several
+// MM actions but NOT Voice, and it also requires subject.active — which this
+// greetd/phosh session does not always satisfy (gnome-calls got Unauthorized
+// even for Location). Grant the MM phone actions to plugdev unconditionally.
+polkit.addRule(function(action, subject) {
+    if ((action.id == "org.freedesktop.ModemManager1.Voice" ||
+         action.id == "org.freedesktop.ModemManager1.Location" ||
+         action.id == "org.freedesktop.ModemManager1.Messaging" ||
+         action.id == "org.freedesktop.ModemManager1.Device.Control") &&
+        subject.isInGroup("plugdev")) {
+        return polkit.Result.YES;
+    }
+});

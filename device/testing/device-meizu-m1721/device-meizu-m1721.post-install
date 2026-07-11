@@ -1,0 +1,38 @@
+#!/bin/sh
+
+# Local compatibility workaround: newer edge mkinitfs expects /usr/sbin/losetup,
+# while this mixed-version rootfs currently provides /sbin/losetup.
+mkdir -p /usr/sbin
+if [ -x /sbin/losetup ] && [ ! -e /usr/sbin/losetup ]; then
+	ln -s /sbin/losetup /usr/sbin/losetup
+fi
+
+# Make sure networking + Bluetooth actually run at boot. The OpenRC service
+# names are LOWERCASE (networkmanager / bluetooth) — the capitalised form
+# silently no-ops (this bit us: NM never started on the r10/r11 flash).
+if command -v rc-update >/dev/null 2>&1; then
+	rc-update add networkmanager default 2>/dev/null || true
+	rc-update add bluetooth default 2>/dev/null || true
+	rc-update add local default 2>/dev/null || true
+	# modem bring-up chain (rmtfs -> pd-mapper/tqftpserv ->
+	# msm-modem-uim-selection -> modemmanager); idempotent
+	rc-update add rmtfs default 2>/dev/null || true
+	rc-update add pd-mapper default 2>/dev/null || true
+	rc-update add tqftpserv default 2>/dev/null || true
+	rc-update add msm-modem-uim-selection default 2>/dev/null || true
+	rc-update add modemmanager default 2>/dev/null || true
+	# battery monitor (batmon report = discharge rate + power hogs)
+	rc-update add batmon default 2>/dev/null || true
+fi
+
+# GNSS used to be auto-enabled at boot; that keeps the modem GPS engine
+# searching 24/7 (drain + heat). Turn it off once; 'gps on' re-enables.
+mmcli -m any --location-disable-gps-nmea --location-disable-gps-raw 2>/dev/null || true
+
+# GTK4 apps (camera preview in particular) render much smoother with the
+# stable GL renderer on Adreno 506/freedreno; pam_env picks this up at login.
+if ! grep -q '^GSK_RENDERER=' /etc/environment 2>/dev/null; then
+	echo 'GSK_RENDERER=gl' >> /etc/environment
+fi
+
+exit 0

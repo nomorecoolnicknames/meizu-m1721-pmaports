@@ -1,0 +1,97 @@
+# Maintainer: M0Rf30 <morf3089@gmail.com>
+# Co-Maintainer: Ultra-azu <ultra.public@proton.me>
+# Co-Maintainer: Barnabas Czeman <trabarni@gmail.com>
+# Kernel config based on: defconfig, msm8953.config, and device configs
+
+_flavor="postmarketos-qcom-msm8953"
+pkgname=linux-$_flavor
+pkgver=7.0.9
+pkgrel=10
+pkgdesc="Close to mainline linux kernel for Qualcomm Snapdragon MSM8953"
+arch="aarch64"
+_carch="arm64"
+url="https://github.com/msm8953-mainline/linux"
+license="GPL-2.0-only"
+options="!strip !check !tracedeps
+	pmb:cross-native
+	pmb:kconfigcheck-community
+"
+makedepends="
+	bison
+	clang
+	findutils
+	flex
+	lld
+	llvm
+	openssl-dev
+	perl
+	postmarketos-installkernel
+	python3
+"
+
+_tag="$pkgver-r0"
+
+source="
+	$pkgname-v$_tag.tar.gz::$url/archive/v$_tag.tar.gz
+	config-$_flavor.aarch64
+	0001-arm64-dts-qcom-add-Meizu-M6-Note-m1721.patch
+	0002-drm-panel-add-Meizu-M6-Note-m1721-HX8399C-TCL-panel-.patch
+	0003-media-i2c-add-Sony-IMX362-sensor-driver.patch
+	0004-ASoC-cs35l35-return-ENOTSUPP-for-unsupported-sysclk.patch
+	0005-ASoC-qcom-apq8016_sbc-clock-CS35L35-speaker-amp-on-Q.patch
+	0006-power-supply-pmi8994_fg-read-charger-status-live.patch
+	0007-media-i2c-add-Samsung-S5K3P8SP-sensor-driver.patch
+	0008-clk-qcom-gcc-msm8953-derive-100-MHz-csi_phytimer-fro.patch
+	0009-ASoC-msm8916-wcd-analog-fix-jack-removal-detection-o.patch
+	0010-ASoC-msm8916-wcd-digital-expose-TX-capture-mute-swit.patch
+	0011-leds-flash-add-Awinic-AW36413-dual-channel-flash-LED.patch
+	0012-Input-qcom-spmi-haptics-enable-output-stage-fix-debo.patch
+	0013-ASoC-qdsp6-q6voice-re-create-CVP-session-on-in-call-.patch
+	0014-iio-light-add-Lite-On-LTR-578ALS-driver.patch
+"
+builddir="$srcdir/linux-$_tag"
+
+prepare() {
+	default_prepare
+	cp "$srcdir/config-$_flavor.$arch" .config
+}
+
+build() {
+	unset LDFLAGS
+	make ARCH="$_carch" LLVM=1 \
+		KBUILD_BUILD_VERSION="$((pkgrel + 1 ))-$_flavor"
+}
+
+package() {
+	mkdir -p "$pkgdir"/boot
+
+	make zinstall modules_install dtbs_install \
+		ARCH="$_carch" \
+		LLVM=1 \
+		INSTALL_PATH="$pkgdir"/boot \
+		INSTALL_MOD_PATH="$pkgdir" \
+		INSTALL_MOD_STRIP=1 \
+		INSTALL_DTBS_PATH="$pkgdir/boot/dtbs"
+	rm -f "$pkgdir"/lib/modules/*/build "$pkgdir"/lib/modules/*/source
+
+	install -Dm644 "$builddir/include/config/kernel.release" \
+		"$pkgdir/usr/share/kernel/$_flavor/kernel.release"
+}
+sha512sums="
+660bb93c2d19efe27a0c19a795801cbbf092f19589b96a857e320345b406a887498a0ab6b0e435b3ef5c244f5c193f82c8a61876853f3a6c1cf0932632d00c5f  linux-postmarketos-qcom-msm8953-v7.0.9-r0.tar.gz
+f94124ee5fec4497eb4f206c32daebc02fbbfcc01c868a434d67830441a69dca885aaee5866823ca67ae58ed7ce247e86875ea0f4f6ade1433d776c94829129b  config-postmarketos-qcom-msm8953.aarch64
+bd568296b917402a91c5348c963dc82e6b3d28cb610f3d9232db514e798af7f8638c9f6b7c6785c1cf7346f8bfaf9b8892447d105a87c1c1d856bf652afbf300  0001-arm64-dts-qcom-add-Meizu-M6-Note-m1721.patch
+1d28a01b069e640b030462740ca3259c1d7c8a5aa395306a85c664f1ce416a1d709867c6083360afb37fd9bdb12ecbc43f6f854a0adcdce5a6a28d3d494d0d67  0002-drm-panel-add-Meizu-M6-Note-m1721-HX8399C-TCL-panel-.patch
+4e000b4d3937d718e4fc4480df0e7e5a7953cc40a9b3602a6c2dee1dfefc7a9bb93564f2fe23cfd8545542ed64ba21e9f0a954e5fd1198641b5f2a78dff6f6ae  0003-media-i2c-add-Sony-IMX362-sensor-driver.patch
+0b7e331121037c6371fb4a01b2ec01dd00fc437774f6f0b7a3d5aa34e9c1d97af43a6ca48a5cdc970a30925fa49ff7761a0d2ddbe004cf7ecd77114df39ea52a  0004-ASoC-cs35l35-return-ENOTSUPP-for-unsupported-sysclk.patch
+72297d66f7b868b62cb20822701d38d79fe646c92b15ed245c0cd29a31e6aa532cac9a6095d01c9a05b512cb45d61b7b26833eed96f59a4f2abf0b223c02c956  0005-ASoC-qcom-apq8016_sbc-clock-CS35L35-speaker-amp-on-Q.patch
+b6e6edbf9a21aaadbf556854d53940cf91b4a3aa97ea3cb4e10a4ada6f94d767905f378fecc21e15e11f78f92d8e9a8e13051d283c95cb3222543b418f7baaf3  0006-power-supply-pmi8994_fg-read-charger-status-live.patch
+d4156373636db2bd2f3b37e09ba9ed80f31ef684fbb92560c4e843aad7c4e3469a66d73710912dc83d05d46fac5fe90c51002234f95b445cba9ec6ca52f40304  0007-media-i2c-add-Samsung-S5K3P8SP-sensor-driver.patch
+ee4af16d3ef3eec6e0c4d61e4346906fdb163d64073408996b9fcb688f94598aa4ee189edd81d27bb24da98fcf79464fb79c70f4b9db511281b95c3506a6c52c  0008-clk-qcom-gcc-msm8953-derive-100-MHz-csi_phytimer-fro.patch
+3d35aca4a2d443f9c470b5585058ad1c771c0cefd3ca71cbd4b8e60e5be471239d404aa6e2a97fd37bb557b1d2f4f0a9d78058e25d6ef3989dfef502939794c9  0009-ASoC-msm8916-wcd-analog-fix-jack-removal-detection-o.patch
+1effabce3d4cdef95174def689ecb43fc3034cf03a78946d5ddadfb8435a0fa30c23d5640f8cd4ce00525f977265b02e11bca6d343f96501960f6b0144b6dc55  0010-ASoC-msm8916-wcd-digital-expose-TX-capture-mute-swit.patch
+cc20522ddd020953468495d0144987d0e29ab5ba911723eb03a7870bb25246e750ad37e5d054514ebe8727903236a3469b62a4a37b3e7fd7ac8e6b782c6cf9fc  0011-leds-flash-add-Awinic-AW36413-dual-channel-flash-LED.patch
+00a78024cb40fc8e17cb7875e2a713d5c07caca99769e33b4bcae38de71e7a73f1fc2f89e9ad86ecc166aacd3eef9f6c1216ac54ab43012b4f1657dd1f188828  0012-Input-qcom-spmi-haptics-enable-output-stage-fix-debo.patch
+f163447197bef49505e96d9f6a27a56264aef95bbd3fc6c85803235b7ef56d18f58aa99af68623c62559688ab833e3ea4531e7672cce161f7b11741cd3e28964  0013-ASoC-qdsp6-q6voice-re-create-CVP-session-on-in-call-.patch
+b1b6df518ca4c07828fece77ef57a4769e9589af5e538b06676e3d0c6c2f4518539a53136ba08eb8f59e756493b2dffbc01eb3a4742dc6c06bab28f1a096f45e  0014-iio-light-add-Lite-On-LTR-578ALS-driver.patch
+"

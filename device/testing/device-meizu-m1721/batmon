@@ -1,0 +1,100 @@
+#!/bin/sh
+# batmon — background battery monitor + power-hog finder for m1721
+# (AccuBattery-style: samples the fuel gauge and per-process CPU, then
+#  `batmon report` names the eaters and the real discharge rate.)
+#
+#   batmon daemon           sampling loop (run by the batmon OpenRC service)
+#   batmon report [hours]   discharge rate + top CPU hogs over last N hours (default 12)
+#
+# Log: /var/log/batmon/batmon.csv, ~1 line/min, self-rotated at 2 MiB.
+
+LOG_DIR=/var/log/batmon
+CSV=$LOG_DIR/batmon.csv
+PROC=$LOG_DIR/proc.csv
+INTERVAL=60
+BAT=/sys/class/power_supply/qcom-battery
+
+sample_procs() {
+    # per-process cumulative CPU ticks: "epoch pid comm ticks"
+    local now=$1
+    for st in /proc/[0-9]*/stat; do
+        awk -v t="$now" '{
+            pid=$1; comm=$2; gsub(/[()]/,"",comm);
+            print t, pid, comm, $14+$15
+        }' "$st" 2>/dev/null
+    done >> "$PROC"
+}
+
+daemon() {
+    mkdir -p "$LOG_DIR"
+    [ -f "$CSV" ] || echo "epoch,capacity,status,current_ua,voltage_uv,temp_dc,load1,maxfreq_khz,gnss" > "$CSV"
+    n=0
+    while :; do
+        now=$(date +%s)
+        cap=$(cat $BAT/capacity 2>/dev/null)
+        st=$(cat $BAT/status 2>/dev/null)
+        cur=$(cat $BAT/current_now 2>/dev/null)
+        vol=$(cat $BAT/voltage_now 2>/dev/null)
+        tmp=$(cat $BAT/temp 2>/dev/null)
+        load=$(cut -d' ' -f1 /proc/loadavg)
+        mf=$(cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq 2>/dev/null | sort -n | tail -1)
+        gnss=$(mmcli -m any --location-status 2>/dev/null | grep -q 'gps-nmea' && echo 1 || echo 0)
+        echo "$now,$cap,$st,$cur,$vol,$tmp,$load,$mf,$gnss" >> "$CSV"
+        # per-process snapshot every 5th sample (keeps proc.csv small)
+        n=$((n+1)); [ $((n % 5)) -eq 1 ] && sample_procs "$now"
+        # rotate at ~2 MiB
+        for f in "$CSV" "$PROC"; do
+            [ -f "$f" ] && [ "$(wc -c < "$f")" -gt 2097152 ] && {
+                tail -n 5000 "$f" > "$f.tmp" && mv "$f.tmp" "$f"; }
+        done
+        sleep $INTERVAL
+    done
+}
+
+report() {
+    hours=${1:-12}
+    since=$(( $(date +%s) - hours*3600 ))
+    [ -f "$CSV" ] || { echo "нет данных ($CSV пуст) — сервис batmon запущен?"; exit 1; }
+    echo "=== batmon: последние ${hours}ч ==="
+    awk -F, -v s=$since '
+        NR>1 && $1>=s {
+            if ($3=="Discharging") {
+                if (!dstart) { dstart=$1; cstart=$2 }
+                dend=$1; cend=$2
+                isum+=$4; icnt++
+            }
+            if ($6>tmax) tmax=$6
+        }
+        END {
+            if (dstart && dend>dstart) {
+                dt=(dend-dstart)/3600.0
+                printf "разряд: %d%% -> %d%% за %.1fч  (%.1f %%/ч)\n", cstart, cend, dt, (cstart-cend)/dt
+                if (icnt) printf "средний ток разряда: %.0f мА\n", (isum/icnt)/1000
+            } else print "разрядных участков не было (на зарядке/мало данных)"
+            if (tmax) printf "макс. температура батареи: %.1f°C\n", tmax/10
+        }' "$CSV"
+    echo "--- топ жрунов CPU (тики за период) ---"
+    [ -f "$PROC" ] && awk -v s=$since '
+        $1>=s {
+            key=$3
+            if (!($2 SUBSEP key in first)) first[$2,key]=$4
+            last[$2,key]=$4
+        }
+        END {
+            for (k in last) {
+                split(k,a,SUBSEP)
+                d=last[k]-first[k]
+                if (d>0) sum[a[2]]+=d
+            }
+            for (c in sum) print sum[c], c
+        }' "$PROC" | sort -rn | head -10 | awk '{printf "%8d  %s\n", $1, $2}'
+    echo "--- GNSS ---"
+    awk -F, -v s=$since 'NR>1 && $1>=s && $9==1 {on++} NR>1 && $1>=s {tot++} END {
+        if (tot) printf "GNSS был включён %d%% времени\n", on*100/tot }' "$CSV"
+}
+
+case "${1:-}" in
+daemon) daemon ;;
+report) shift; report "$@" ;;
+*) echo "usage: batmon <daemon|report [hours]>"; exit 1 ;;
+esac

@@ -1,0 +1,48 @@
+From: Claude <noreply@anthropic.com>
+Date: Fri, 10 Jul 2026 16:00:00 +0200
+Subject: [PATCH] pipeline: simple: Raise default stream buffer count to 8
+
+The processed-stream bufferCount defaults to 4. Through the PipeWire
+libcamera SPA source the negotiated buffer ring is pinned to exactly
+this value (spa libcamera-source advertises
+SPA_POD_CHOICE_RANGE_Int(n, n, n) with n = streamConfig.bufferCount).
+
+A deep consumer pipeline holds several of those buffers concurrently.
+GNOME Snapshot's camerabin chain (decodebin3/multiqueue + tee + two
+queues + the GTK4 paintable which keeps the current and pending frame
+alive) retains 5+ buffers, exhausting a 4-buffer ring. Measured on
+meizu-m1721 (msm8953, SoftISP): the viewfinder then cycles between
+~0.4 s bursts at the sensor rate and ~1.05 s windows where the source
+delivers nothing (frames dropped at the producer), i.e. ~9 fps
+average with metronomic 1 s freezes, while a shallow
+pipewiresrc ! fakesink pipeline on the same node sustains a steady
+28.6 fps.
+
+Raise the default to 8 so a deep client pipeline leaves buffers
+cycling. Requests in flight to the capture device remain capped by
+kMaxQueuedRequestsDevice (4) and the bayer-side kNumInternalBuffers
+is unchanged, so device behaviour is not affected; the cost is four
+more output buffers from the dma-buf heap (~8.3 MB each at 1080p
+BGRx).
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+diff --git a/src/libcamera/pipeline/simple/simple.cpp b/src/libcamera/pipeline/simple/simple.cpp
+--- a/src/libcamera/pipeline/simple/simple.cpp
++++ b/src/libcamera/pipeline/simple/simple.cpp
+@@ -389,7 +389,14 @@
+ 	const Transform &combinedTransform() const { return combinedTransform_; }
+
+ private:
+-	static constexpr unsigned int kNumBuffersDefault = 4;
++	/*
++	 * Deep consumer pipelines (PipeWire SPA ring == bufferCount; e.g.
++	 * GNOME Snapshot's camerabin holds 5+ buffers across multiqueue,
++	 * tee, queues and the GTK paintable) starve a 4-buffer ring and the
++	 * preview stalls in ~1 s cycles. 8 leaves headroom; device-side
++	 * queue depth stays capped by kMaxQueuedRequestsDevice.
++	 */
++	static constexpr unsigned int kNumBuffersDefault = 8;
+ 	static constexpr unsigned int kNumBuffersMax = 32;
+
+ 	/*

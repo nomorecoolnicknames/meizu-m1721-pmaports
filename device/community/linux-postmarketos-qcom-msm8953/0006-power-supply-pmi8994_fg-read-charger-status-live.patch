@@ -1,0 +1,51 @@
+From 0162e4124dae18af0cde79b9136907f208ebf318 Mon Sep 17 00:00:00 2001
+From: nomorecoolnicknames <78512247+nomorecoolnicknames@users.noreply.github.com>
+Date: Fri, 10 Jul 2026 14:12:17 -0500
+Subject: [PATCH] power: supply: pmi8994_fg: read charger status live
+
+The fuel gauge answers POWER_SUPPLY_PROP_STATUS from a cached
+chip->status that is only refreshed by the charger's
+power_supply_changed notifications. When the charger never emits such
+an event after probe, the cache stays POWER_SUPPLY_STATUS_UNKNOWN and
+the property falls back to the capacity/current-based estimate, which
+reports Discharging even while a charger is plugged in. Observed on
+the Meizu M6 Note (m1721, PMI8950).
+
+Query the charger's status property directly instead of relying on the
+cached value, and keep the current-based fallback for when the charger
+is absent or the read fails.
+
+Signed-off-by: nomorecoolnicknames <78512247+nomorecoolnicknames@users.noreply.github.com>
+Assisted-by: Claude (Anthropic)
+---
+ drivers/power/supply/pmi8994_fg.c | 14 +++++++++++---
+ 1 file changed, 11 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/power/supply/pmi8994_fg.c b/drivers/power/supply/pmi8994_fg.c
+index eafa8fd97..e9cb7a5b8 100644
+--- a/drivers/power/supply/pmi8994_fg.c
++++ b/drivers/power/supply/pmi8994_fg.c
+@@ -624,9 +624,17 @@ static int pmi8994_fg_get_property(struct power_supply *psy,
+ 
+ 	switch (psp) {
+ 	case POWER_SUPPLY_PROP_STATUS:
+-		/* Get status from charger if available */
+-		if (chip->chg_psy && chip->status != POWER_SUPPLY_STATUS_UNKNOWN) {
+-			val->intval = chip->status;
++		/*
++		 * Get status from the charger if available. Read it live: the
++		 * cached chip->status can stay UNKNOWN when the charger never
++		 * emits a power_supply_changed event after probe, which makes
++		 * the current-based fallback report Discharging even while a
++		 * charger is plugged in.
++		 */
++		if (chip->chg_psy &&
++		    !power_supply_get_property(chip->chg_psy,
++					      POWER_SUPPLY_PROP_STATUS, val)) {
++			/* val->intval already set from the charger */
+ 		} else {
+ 			/*
+ 			 * Fall back to capacity and current-based
+-- 
+2.39.5
+

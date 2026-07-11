@@ -1,0 +1,32 @@
+#!/bin/sh
+# torch <on|off> [mA] — rear flashlight for m1721 (AW36413 @0x6b on i2c-2).
+# The chip arms its boost on a HWEN rising edge, so 'on' power-cycles HWEN
+# (tlmm gpio95+93) then holds it high via a detached gpioset. Run as root.
+# Only 2 of the 4 ring LEDs light — the 2nd AW36413 is on i2c_5 (disabled in DT).
+set -eu
+BUS=2; ADDR=0x6b; CHIP=gpiochip0
+HOLD="gpioset -c $CHIP 95=1 93=1"
+i2s(){ i2cset -y -f "$BUS" "$ADDR" "$1" "$2"; }
+release(){ pkill -f "$HOLD" 2>/dev/null || true; }
+case "${1:-}" in
+on)
+  MA="${2:-200}"; [ "$MA" -gt 300 ] && MA=300
+  CODE=$(( (100*MA + 280)/560 - 1 )); [ "$CODE" -lt 0 ] && CODE=0
+  HEX=$(printf '0x%02x' "$CODE")
+  release
+  gpioset -c $CHIP 95=0 93=0 & L=$!; sleep 0.1; kill "$L" 2>/dev/null || true; sleep 0.05
+  setsid $HOLD </dev/null >/dev/null 2>&1 &
+  sleep 0.2
+  i2s 0x05 "$HEX"      # LED1 torch level
+  i2s 0x06 "$HEX"      # LED2 torch level
+  i2s 0x08 0x16        # TIMING (vendor value)
+  i2s 0x01 0x0b        # ENABLE: torch mode, both LEDs
+  echo "torch ON  ~${MA}mA/LED  (enable=$(i2cget -y -f $BUS $ADDR 0x01), faults $(i2cget -y -f $BUS $ADDR 0x0a)/$(i2cget -y -f $BUS $ADDR 0x0b))"
+  ;;
+off)
+  i2s 0x01 0x00 2>/dev/null || true
+  release
+  echo "torch OFF"
+  ;;
+*) echo "usage: torch <on|off> [mA]"; exit 1 ;;
+esac

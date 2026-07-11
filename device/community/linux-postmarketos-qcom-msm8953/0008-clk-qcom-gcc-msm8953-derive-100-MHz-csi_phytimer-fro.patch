@@ -1,0 +1,47 @@
+From aba4b96b0bd9ce05a89145376f523c937c6d3b93 Mon Sep 17 00:00:00 2001
+From: nomorecoolnicknames <78512247+nomorecoolnicknames@users.noreply.github.com>
+Date: Fri, 10 Jul 2026 14:15:08 -0500
+Subject: [PATCH] clk: qcom: gcc-msm8953: derive 100 MHz csi_phytimer from
+ GPLL0
+
+On MSM8953 (observed on the Meizu M6 Note (m1721)) the
+gcc_camss_csiXphytimer_clk branch never leaves HALT when its RCG is
+programmed with the 100 MHz F(GPLL0_DIV2, 4) entry: camss STREAMON
+fails with "gcc_camss_csi2phytimer_clk status stuck at 'off'" and the
+clock enable returns -EBUSY. Reprogramming the same RCG to the 200 MHz
+F(GPLL0, 4) entry (by selecting the sensor's 630 MHz link-freq mode)
+enables the branch and streams full 4608x3456 RAW10 frames on the same
+CSIPHY2, so the PHY, branch and RCG are fine; only the
+GPLL0_DIV2-parented entry is broken (the div2 tap does not feed the
+camss phytimer branches on this SoC).
+
+Keep the 100 MHz rate (needed for low-link-freq/binned sensor modes)
+but derive it from the proven GPLL0 parent: 800 MHz / 8 = 100 MHz
+exactly.
+
+Signed-off-by: nomorecoolnicknames <78512247+nomorecoolnicknames@users.noreply.github.com>
+Assisted-by: Claude (Anthropic)
+---
+ drivers/clk/qcom/gcc-msm8953.c | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/clk/qcom/gcc-msm8953.c b/drivers/clk/qcom/gcc-msm8953.c
+index c4ec9950a..e8ff722f2 100644
+--- a/drivers/clk/qcom/gcc-msm8953.c
++++ b/drivers/clk/qcom/gcc-msm8953.c
+@@ -964,7 +964,11 @@ static struct clk_rcg2 csi2p_clk_src = {
+ };
+ 
+ static const struct freq_tbl ftbl_csi_phytimer_clk_src[] = {
+-	F(100000000, P_GPLL0_DIV2, 4, 0, 0),
++	/*
++	 * 100 MHz from GPLL0/8, not GPLL0_DIV2/4: the csiXphytimer branch
++	 * clocks never leave HALT when fed from the GPLL0_DIV2 tap.
++	 */
++	F(100000000, P_GPLL0, 8, 0, 0),
+ 	F(200000000, P_GPLL0, 4, 0, 0),
+ 	F(266670000, P_GPLL0, 3, 0, 0),
+ 	{ }
+-- 
+2.39.5
+

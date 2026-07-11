@@ -1,0 +1,42 @@
+From ace608eb97d9168218e2790468657439ed43bb29 Mon Sep 17 00:00:00 2001
+From: nomorecoolnicknames <78512247+nomorecoolnicknames@users.noreply.github.com>
+Date: Fri, 10 Jul 2026 14:10:17 -0500
+Subject: [PATCH] ASoC: cs35l35: return -ENOTSUPP for unsupported sysclk
+
+The APQ8016/MSM8953 machine driver (apq8016_sbc) walks every codec on a
+DAI link and calls snd_soc_component_set_sysclk() with the board's
+shared digital-codec MCLK (9.6 MHz on MSM8953). It treats any error
+other than -ENOTSUPP as fatal to link->init, which aborts the whole
+sound card. When a CS35L35 shares such a card (e.g. Meizu M6 Note
+(m1721), where the amp sits on its own MI2S link while the WCD internal
+codec drives the headphone/earpiece path), the amp being offered a
+frequency outside its supported reference list must not tear down the
+working WCD path.
+
+Return -ENOTSUPP instead of -EINVAL for an unsupported clock frequency
+so a machine driver can gracefully skip the amp on this link and keep
+the rest of the card alive. The frequency is genuinely unsupported (not
+a bad argument), so -ENOTSUPP is the correct errno.
+
+Signed-off-by: nomorecoolnicknames <78512247+nomorecoolnicknames@users.noreply.github.com>
+Assisted-by: Claude (Anthropic)
+---
+ sound/soc/codecs/cs35l35.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/sound/soc/codecs/cs35l35.c b/sound/soc/codecs/cs35l35.c
+index 7a01b1d9f..d5560ea37 100644
+--- a/sound/soc/codecs/cs35l35.c
++++ b/sound/soc/codecs/cs35l35.c
+@@ -743,7 +743,7 @@ static int cs35l35_component_set_sysclk(struct snd_soc_component *component,
+ 		break;
+ 	default:
+ 		dev_err(component->dev, "Invalid CLK Frequency Input : %d\n", freq);
+-		return -EINVAL;
++		return -ENOTSUPP;
+ 	}
+ 
+ 	ret = regmap_update_bits(cs35l35->regmap, CS35L35_CLK_CTL1,
+-- 
+2.39.5
+

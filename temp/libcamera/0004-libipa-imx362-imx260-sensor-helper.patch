@@ -1,0 +1,39 @@
+From: nomorecoolnicknames <unisocofficial@gmail.com>
+Date: Wed, 08 Jul 2026 00:00:00 +0000
+Subject: [PATCH] libipa: add IMX362/IMX260 sensor helper (reuse IMX258 gain law)
+
+The Meizu M6 Note rear sensor (imx362 driver, physical IMX260) shares the Sony
+smartphone-sensor gain law with IMX258. Without a helper the simple-IPA AGC
+assumes linear gain and oscillates. Register imx362/imx260 to the IMX258 helper.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+---
+ src/ipa/libipa/camera_sensor_helper.cpp | 16 ++++++++++++++++
+ 1 file changed, 16 insertions(+)
+
+diff --git a/src/ipa/libipa/camera_sensor_helper.cpp b/src/ipa/libipa/camera_sensor_helper.cpp
+--- a/src/ipa/libipa/camera_sensor_helper.cpp	2026-07-08 02:46:23.008515796 -0500
++++ b/src/ipa/libipa/camera_sensor_helper.cpp	2026-07-08 02:46:43.812814349 -0500
+@@ -566,6 +566,22 @@
+ };
+ REGISTER_CAMERA_SENSOR_HELPER("imx258", CameraSensorHelperImx258)
+ 
++/*
++ * Sony IMX362 / IMX260 (Meizu M6 Note rear). Same Sony smartphone-sensor
++ * programming interface as the IMX258: analogue gain law gain = 512/(512-code)
++ * and a 0x40 (10-bit) black-level pedestal. Reuse the IMX258 helper so the
++ * simple-IPA AGC maps gain correctly (otherwise exposure/colour oscillate).
++ */
++class CameraSensorHelperImx362 : public CameraSensorHelperImx258
++{
++};
++REGISTER_CAMERA_SENSOR_HELPER("imx362", CameraSensorHelperImx362)
++
++class CameraSensorHelperImx260 : public CameraSensorHelperImx258
++{
++};
++REGISTER_CAMERA_SENSOR_HELPER("imx260", CameraSensorHelperImx260)
++
+ class CameraSensorHelperImx283 : public CameraSensorHelper
+ {
+ public:

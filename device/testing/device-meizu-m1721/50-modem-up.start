@@ -1,0 +1,21 @@
+#!/bin/sh
+# m1721: wait for MSS modem firmware to boot, then start pd-mapper + (re)start
+# ModemManager so it enumerates the late-appearing QMI/QRTR modem.
+i=0
+while [ $i -lt 60 ]; do
+	for r in /sys/class/remoteproc/remoteproc*; do
+		case "$(cat "$r/name" 2>/dev/null)" in
+		*4080000*)
+			if [ "$(cat "$r/state" 2>/dev/null)" = "running" ]; then
+				rc-service pd-mapper start >/dev/null 2>&1
+				sleep 1
+				rc-service modemmanager restart >/dev/null 2>&1
+				exit 0
+			fi
+			;;
+		esac
+	done
+	i=$((i + 1))
+	sleep 1
+done
+exit 0

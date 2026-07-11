@@ -1,0 +1,74 @@
+From a72e2f1ece05cab3fb6749597b4588d7c5644d0e Mon Sep 17 00:00:00 2001
+From: nomorecoolnicknames <78512247+nomorecoolnicknames@users.noreply.github.com>
+Date: Fri, 10 Jul 2026 14:15:59 -0500
+Subject: [PATCH] ASoC: msm8916-wcd-analog: fix jack removal detection on
+ normally-open jacks
+
+On the Meizu M6 Note (m1721, MSM8953/PM8953) with
+qcom,hphl/gnd-jack-type-normally-open, headset insertion is detected
+but removal never is: once plugged, the jack stays reported present
+forever.
+
+pm8916_wcd_setup_mbhc() full-writes MBHC_DET_CTL_1, clearing the
+POR-set undocumented bit 0 (POR 0x35). The downstream msm-analog-cdc
+only ever touches bits 7:3 of this register; clearing bit 0 leaves
+mechanical removal detection dead on a normally-open jack. Use
+update_bits to program bits 7:3 and preserve bits 1:0, and use the
+downstream 96 ms insert/remove debounce (the 256 ms encoding is never
+used on this codec generation). The insertion path and the switch IRQ
+handler are unchanged.
+
+(Targets the msm8953-mainline fork's msm8916-wcd-analog.c, which
+carries extra lineout/GPIO-jack code and differs from mainline.)
+
+Signed-off-by: nomorecoolnicknames <78512247+nomorecoolnicknames@users.noreply.github.com>
+Assisted-by: Claude (Anthropic)
+---
+ sound/soc/codecs/msm8916-wcd-analog.c | 17 +++++++++++++++--
+ 1 file changed, 15 insertions(+), 2 deletions(-)
+
+diff --git a/sound/soc/codecs/msm8916-wcd-analog.c b/sound/soc/codecs/msm8916-wcd-analog.c
+index 53e06ecdb..bf47206be 100644
+--- a/sound/soc/codecs/msm8916-wcd-analog.c
++++ b/sound/soc/codecs/msm8916-wcd-analog.c
+@@ -175,6 +175,7 @@
+ #define CDC_A_MBHC_FSM_CTL_BTN_ISRC_CTRL_MASK		GENMASK(6, 4)
+ #define CDC_A_MBHC_DBNC_TIMER		(0xf152)
+ #define CDC_A_MBHC_DBNC_TIMER_BTN_DBNC_T_16MS		BIT(3)
++#define CDC_A_MBHC_DBNC_TIMER_INSREM_DBNC_T_96_MS	(0x6 << 4)
+ #define CDC_A_MBHC_DBNC_TIMER_INSREM_DBNC_T_256_MS	(0x9 << 4)
+ #define CDC_A_MBHC_BTN0_ZDET_CTL_0	(0xf153)
+ #define CDC_A_MBHC_BTN1_ZDET_CTL_1	(0xf154)
+@@ -494,7 +495,19 @@ static void pm8916_wcd_setup_mbhc(struct pm8916_wcd_analog_priv *wcd)
+ 	u32 plug_type = 0;
+ 	u32 int_en_mask = 0;
+ 
+-	snd_soc_component_write(component, CDC_A_MBHC_DET_CTL_1,
++	/*
++	 * Program only bits 7:3 and preserve the power-on-reset value of the
++	 * undocumented bits 1:0 (POR 0x35, bit 0 set). A full write that
++	 * clears bit 0 disables mechanical removal detection on a
++	 * normally-open jack; downstream msm-analog-cdc only ever touches
++	 * bits 7:3 here.
++	 */
++	snd_soc_component_update_bits(component, CDC_A_MBHC_DET_CTL_1,
++		      CDC_A_MBHC_DET_CTL_L_DET_EN |
++		      CDC_A_MBHC_DET_CTL_GND_DET_EN |
++		      CDC_A_MBHC_DET_CTL_MECH_DET_TYPE_MASK |
++		      CDC_A_MBHC_DET_CTL_MIC_CLAMP_CTL_MASK |
++		      CDC_A_MBHC_DET_CTL_MBHC_BIAS_EN,
+ 		      CDC_A_MBHC_DET_CTL_L_DET_EN |
+ 		      CDC_A_MBHC_DET_CTL_MECH_DET_TYPE_INSERTION |
+ 		      CDC_A_MBHC_DET_CTL_MIC_CLAMP_CTL_AUTO |
+@@ -514,7 +527,7 @@ static void pm8916_wcd_setup_mbhc(struct pm8916_wcd_analog_priv *wcd)
+ 
+ 
+ 	snd_soc_component_write(component, CDC_A_MBHC_DBNC_TIMER,
+-		      CDC_A_MBHC_DBNC_TIMER_INSREM_DBNC_T_256_MS |
++		      CDC_A_MBHC_DBNC_TIMER_INSREM_DBNC_T_96_MS |
+ 		      CDC_A_MBHC_DBNC_TIMER_BTN_DBNC_T_16MS);
+ 
+ 	/* enable MBHC clock */
+-- 
+2.39.5
+

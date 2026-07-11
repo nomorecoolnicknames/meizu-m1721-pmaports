@@ -1,0 +1,1292 @@
+From 805d0794c1e9b073337439a9e83584cd89247171 Mon Sep 17 00:00:00 2001
+From: nomorecoolnicknames <78512247+nomorecoolnicknames@users.noreply.github.com>
+Date: Fri, 10 Jul 2026 14:14:21 -0500
+Subject: [PATCH] media: i2c: add Samsung S5K3P8SP sensor driver
+
+Add a V4L2 subdev driver for the Samsung S5K3P8SP (S5K3P8SP03), the
+16 Mpix ISOCELL front (selfie) sensor on the Meizu M6 Note (m1721,
+Qualcomm MSM8953). It sits on CCI/I2C master 1 and CSIPHY2, matched by
+model id 0x3108 read from register 0x0000.
+
+S5K3P8SP exposes the SMIA++ control block, so the driver mirrors the
+mainline IMX258/IMX362 architecture: V4L2 CCI (regmap) register access,
+PM-runtime power (regulators + clk + reset GPIO), v4l2_fwnode CSI-2
+DPHY endpoint parsing, and the standard control set (exposure 0x0202,
+analogue gain 0x0204, per-channel digital gain 0x020e..0x0214, test
+pattern 0x0600, vblank/hblank, pixel_rate/link_freq, h/vflip). The
+downstream kernel ships no register tables (the vendor camera stack
+keeps them in a userspace HAL blob), so the proprietary global-init and
+per-mode geometry + PLL "setfile" is ported from the Samsung Exynos
+fimc-is CIS driver:
+
+  LineageOS/android_kernel_samsung_universal9810 (Galaxy S9+,
+  Exynos9810), branch lineage-17.1, commit
+  2b92eefa41e817672c6538c1312f4c202966e578 (Samsung G965F Android Q
+  OSRC),
+  .../fimc-is2/sensor/module_framework/cis/fimc-is-cis-3p8sp-setA.h
+  (sha256 478c5a6c316ed376f009ffa5abbacbb173707346d69596dcf35cac2438fb369b)
+  and fimc-is-cis-3p8sp.c.
+
+Two modes are provided: 4608x3456 full and 2304x1728 2x2 binned, both
+VTS 0x0e1a / HTS 0x1400. The Samsung (addr, value, size) triplets are
+transcribed 1:1 to CCI_REG16 sequences, preserving order.
+
+The Exynos source runs a 26 MHz EXT_CLK; the m1721 feeds MCLK1 =
+24 MHz. The PLL dividers are left verbatim, so the outputs scale by
+24/26: MIPI link frequency 630 MHz (full) / 330 MHz (binned) and
+readout ~27 fps. Those 24 MHz-derived link-frequencies/pixel-rates are
+advertised by the driver and must be listed in the DT endpoint. The one
+value adapted from the raw setfile is 0x0136 (EXCK_FREQ), set to
+24.0 MHz to match the real input clock.
+
+Cross-compiled clean for arm64 (CONFIG_VIDEO_S5K3P8SP=m, W=1).
+
+Signed-off-by: nomorecoolnicknames <78512247+nomorecoolnicknames@users.noreply.github.com>
+Assisted-by: Claude (Anthropic)
+---
+ drivers/media/i2c/Kconfig    |   10 +
+ drivers/media/i2c/Makefile   |    1 +
+ drivers/media/i2c/s5k3p8sp.c | 1198 ++++++++++++++++++++++++++++++++++
+ 3 files changed, 1209 insertions(+)
+ create mode 100644 drivers/media/i2c/s5k3p8sp.c
+
+diff --git a/drivers/media/i2c/Kconfig b/drivers/media/i2c/Kconfig
+index 8aaf52d1b..01c39df26 100644
+--- a/drivers/media/i2c/Kconfig
++++ b/drivers/media/i2c/Kconfig
+@@ -290,6 +290,16 @@ config VIDEO_IMX362
+ 	  To compile this driver as a module, choose M here: the
+ 	  module will be called imx362.
+ 
++config VIDEO_S5K3P8SP
++	tristate "Samsung S5K3P8SP sensor support"
++	select V4L2_CCI_I2C
++	help
++	  This is a Video4Linux2 sensor driver for the Samsung
++	  S5K3P8SP camera.
++
++	  To compile this driver as a module, choose M here: the
++	  module will be called s5k3p8sp.
++
+ config VIDEO_IMX412
+ 	tristate "Sony IMX412 sensor support"
+ 	depends on OF_GPIO
+diff --git a/drivers/media/i2c/Makefile b/drivers/media/i2c/Makefile
+index 8fc21ee18..e03904082 100644
+--- a/drivers/media/i2c/Makefile
++++ b/drivers/media/i2c/Makefile
+@@ -60,6 +60,7 @@ obj-$(CONFIG_VIDEO_IMX334) += imx334.o
+ obj-$(CONFIG_VIDEO_IMX335) += imx335.o
+ obj-$(CONFIG_VIDEO_IMX355) += imx355.o
+ obj-$(CONFIG_VIDEO_IMX362) += imx362.o
++obj-$(CONFIG_VIDEO_S5K3P8SP) += s5k3p8sp.o
+ obj-$(CONFIG_VIDEO_IMX412) += imx412.o
+ obj-$(CONFIG_VIDEO_IMX415) += imx415.o
+ obj-$(CONFIG_VIDEO_IR_I2C) += ir-kbd-i2c.o
+diff --git a/drivers/media/i2c/s5k3p8sp.c b/drivers/media/i2c/s5k3p8sp.c
+new file mode 100644
+index 000000000..409819e2a
+--- /dev/null
++++ b/drivers/media/i2c/s5k3p8sp.c
+@@ -0,0 +1,1198 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Samsung S5K3P8SP CMOS image sensor driver
++ *
++ * Copyright (C) 2026 postmarketOS contributors
++ *
++ * The S5K3P8SP (S5K3P8SP03) is a 1/3.1", 16 Mpix ISOCELL image sensor. On the
++ * Meizu M6 Note (m1721, Qualcomm MSM8953) it is the FRONT (selfie) sensor,
++ * wired to CCI/I2C master 1 and CSIPHY2, MCLK1 (gpio27), reset gpio129,
++ * vana load-switch gpio36, vdig pm8953_l2, vio pm8953_l6.
++ *
++ * Register setfile (global init, per-mode geometry, PLL) ported from the Samsung
++ * Exynos fimc-is CIS driver:
++ *   repo   LineageOS/android_kernel_samsung_universal9810 (Galaxy S9+, Exynos9810)
++ *   branch lineage-17.1, commit 2b92eefa41e817672c6538c1312f4c202966e578
++ *          ("import G965FXXU7DTAA OSRC" -- Samsung G965F Android Q OSRC)
++ *   files  drivers/media/platform/exynos/fimc-is2/sensor/module_framework/cis/
++ *          fimc-is-cis-3p8sp-setA.h  (sha256 478c5a6c316ed376f009ffa5abbacbb1
++ *                                            73707346d69596dcf35cac2438fb369b)
++ *          fimc-is-cis-3p8sp.c       (sha256 6999ccdbf856f2abd39cef67ad5a749c
++ *                                            1510c0c2bab0a696a213688dc852aefe)
++ * The flat Samsung arrays are (addr, value, size) triplets with size 0x02 =
++ * 16-bit write; they are transcribed 1:1 into cci_reg_sequence CCI_REG16 form,
++ * preserving order (including the indirect 0x6028/0x602A/0x6F12 accesses).
++ *
++ * Clock adaptation: the Exynos source runs the sensor from a 26 MHz EXT_CLK
++ * (0x0136 = 0x1A00) but the m1721 feeds MCLK1 = 24 MHz. The sensor PLL is
++ * driven by the physical input pin, so with the setfile's PLL dividers left
++ * verbatim the outputs scale by 24/26: MIPI link-freq becomes 630 MHz (full) /
++ * 330 MHz (binned) and readout ~27 fps (vs 30 at 26 MHz). Those 24 MHz-derived
++ * link-frequencies/pixel-rates are what this driver advertises and what the DT
++ * endpoint must list. The one register touched vs the raw setfile is 0x0136
++ * (EXCK_FREQ), set to 0x1800 = 24.0 MHz so the sensor firmware knows its true
++ * input clock.
++ */
++
++#include <linux/clk.h>
++#include <linux/delay.h>
++#include <linux/gpio/consumer.h>
++#include <linux/i2c.h>
++#include <linux/module.h>
++#include <linux/pm_runtime.h>
++#include <linux/regulator/consumer.h>
++
++#include <media/v4l2-cci.h>
++#include <media/v4l2-ctrls.h>
++#include <media/v4l2-device.h>
++#include <media/v4l2-fwnode.h>
++
++#define S5K3P8SP_REG_MODE_SELECT	CCI_REG8(0x0100)
++#define S5K3P8SP_MODE_STANDBY		0x00
++#define S5K3P8SP_MODE_STREAMING		0x01
++
++/*
++ * Indirect / page-select access used by the Samsung setfile. 0x6028 selects the
++ * upper 16 bits of the 32-bit register address (0x4000 = the SMIA++ control
++ * page, 0x2000 = the sensor trim page); 0x602A/0x6F12 are the address-low / data
++ * ports for auto-incrementing TnP writes. Replayed verbatim from the setfile.
++ */
++#define S5K3P8SP_REG_PAGE_SELECT	CCI_REG16(0x6028)
++#define S5K3P8SP_PAGE_CONTROL		0x4000
++/* Internal controller (ARM) enable -- boots the sensor firmware. */
++#define S5K3P8SP_REG_FW_ENABLE		CCI_REG16(0x6010)
++
++/* Chip ID: Samsung SMIA++ exposes the 16-bit model id at register 0x0000. */
++#define S5K3P8SP_REG_CHIP_ID		CCI_REG16(0x0000)
++#define S5K3P8SP_CHIP_ID		0x3108
++
++/*
++ * V-timing (frame length lines / VTS); the setfile uses 0x0e1a (3610 lines)
++ * in both modes.
++ */
++#define S5K3P8SP_REG_FLL		CCI_REG16(0x0340)
++#define S5K3P8SP_VTS_30FPS		0x0e1a
++#define S5K3P8SP_VTS_MAX		0xffff
++
++/* H-timing: line length; the setfile uses 5120 in both modes. */
++#define S5K3P8SP_PPL_DEFAULT		5120
++
++/* Exposure (coarse integration time), SMIA++ 0x0202 */
++#define S5K3P8SP_REG_EXPOSURE		CCI_REG16(0x0202)
++#define S5K3P8SP_EXPOSURE_OFFSET	4
++#define S5K3P8SP_EXPOSURE_MIN		6
++#define S5K3P8SP_EXPOSURE_STEP		1
++#define S5K3P8SP_EXPOSURE_DEFAULT	0x0100
++#define S5K3P8SP_EXPOSURE_MAX		(S5K3P8SP_VTS_MAX - S5K3P8SP_EXPOSURE_OFFSET)
++
++/*
++ * Analogue gain (SMIA++ 0x0204): Samsung linear code, 1/32 steps,
++ * 0x20 = 1.0x. The standard 3P8SP span is x1.0..x16 (code 0x20..0x200).
++ */
++#define S5K3P8SP_REG_ANALOG_GAIN	CCI_REG16(0x0204)
++#define S5K3P8SP_ANA_GAIN_MIN		0x20	/* 1.0x */
++#define S5K3P8SP_ANA_GAIN_MAX		0x200	/* 16x */
++#define S5K3P8SP_ANA_GAIN_STEP		1
++#define S5K3P8SP_ANA_GAIN_DEFAULT	0x20
++
++/* Digital gain (SMIA++ per-channel Gr/R/B/Gb, 8.8 fixed point, 0x0100 = 1x) */
++#define S5K3P8SP_REG_GR_DIGITAL_GAIN	CCI_REG16(0x020e)
++#define S5K3P8SP_REG_R_DIGITAL_GAIN	CCI_REG16(0x0210)
++#define S5K3P8SP_REG_B_DIGITAL_GAIN	CCI_REG16(0x0212)
++#define S5K3P8SP_REG_GB_DIGITAL_GAIN	CCI_REG16(0x0214)
++#define S5K3P8SP_DGTL_GAIN_MIN		0x0100	/* unity */
++#define S5K3P8SP_DGTL_GAIN_MAX		0x1000	/* 16x */
++#define S5K3P8SP_DGTL_GAIN_DEFAULT	0x0100
++#define S5K3P8SP_DGTL_GAIN_STEP		1
++
++/* Test pattern (SMIA++ 0x0600) */
++#define S5K3P8SP_REG_TEST_PATTERN	CCI_REG16(0x0600)
++
++/* Orientation (SMIA++ 0x0101) */
++#define S5K3P8SP_REG_ORIENTATION	CCI_REG8(0x0101)
++
++/*
++ * S5K3P8SP native / active pixel array (from the fimc-is CIS driver);
++ * full-res output is 4608x3456.
++ */
++#define S5K3P8SP_NATIVE_WIDTH		4608U
++#define S5K3P8SP_NATIVE_HEIGHT		3488U
++#define S5K3P8SP_PIXEL_ARRAY_LEFT	0U
++#define S5K3P8SP_PIXEL_ARRAY_TOP	16U
++#define S5K3P8SP_PIXEL_ARRAY_WIDTH	4608U
++#define S5K3P8SP_PIXEL_ARRAY_HEIGHT	3456U
++
++struct s5k3p8sp_reg_list {
++	u32 num_of_regs;
++	const struct cci_reg_sequence *regs;
++};
++
++struct s5k3p8sp_link_freq_config {
++	u32 pixels_per_line;
++};
++
++struct s5k3p8sp_mode {
++	u32 width;
++	u32 height;
++	u32 vts_def;
++	u32 vts_min;
++	u32 link_freq_index;
++	struct s5k3p8sp_reg_list reg_list;
++	struct v4l2_rect crop;
++};
++
++/*
++ * Global init, transcribed from sensor_3p8sp_setfile_A_Global[] starting
++ * after the ARM-boot + 3 ms delay (0x6214 onward). The ARM boot
++ * (0x6028=0x4000, 0x6010=0x0001) and the 3 ms firmware-settle delay are
++ * issued in s5k3p8sp_start_streaming() ahead of this block.
++ */
++static const struct cci_reg_sequence s5k3p8sp_global_regs[] = {
++	{ CCI_REG16(0x6214), 0x7971 },
++	{ CCI_REG16(0x6218), 0x7150 },
++	{ CCI_REG16(0x6028), 0x2000 },
++	{ CCI_REG16(0x602a), 0x2f38 },
++	{ CCI_REG16(0x6f12), 0x0088 },
++	{ CCI_REG16(0x6f12), 0x0d70 },
++	{ CCI_REG16(0x0202), 0x0200 },
++	{ CCI_REG16(0x0200), 0x0618 },
++	{ CCI_REG16(0x3604), 0x0002 },
++	{ CCI_REG16(0x3606), 0x0103 },
++	{ CCI_REG16(0xf496), 0x0048 },
++	{ CCI_REG16(0xf470), 0x0020 },
++	{ CCI_REG16(0xf43a), 0x0015 },
++	{ CCI_REG16(0xf484), 0x0006 },
++	{ CCI_REG16(0xf440), 0x00af },
++	{ CCI_REG16(0xf442), 0x44c6 },
++	{ CCI_REG16(0xf408), 0xfff7 },
++	{ CCI_REG16(0x3664), 0x0019 },
++	{ CCI_REG16(0xf494), 0x1010 },
++	{ CCI_REG16(0x367a), 0x0100 },
++	{ CCI_REG16(0x362a), 0x0104 },
++	{ CCI_REG16(0x362e), 0x0404 },
++	{ CCI_REG16(0x32b2), 0x0008 },
++	{ CCI_REG16(0x3286), 0x0003 },
++	{ CCI_REG16(0x328a), 0x0005 },
++	{ CCI_REG16(0xf47c), 0x001f },
++	{ CCI_REG16(0xf62e), 0x00c5 },
++	{ CCI_REG16(0xf630), 0x00cd },
++	{ CCI_REG16(0xf632), 0x00dd },
++	{ CCI_REG16(0xf634), 0x00e5 },
++	{ CCI_REG16(0xf636), 0x00f5 },
++	{ CCI_REG16(0xf638), 0x00fd },
++	{ CCI_REG16(0xf63a), 0x010d },
++	{ CCI_REG16(0xf63c), 0x0115 },
++	{ CCI_REG16(0xf63e), 0x0125 },
++	{ CCI_REG16(0xf640), 0x012d },
++	{ CCI_REG16(0x3070), 0x0000 },
++	{ CCI_REG16(0x0b0e), 0x0000 },
++	{ CCI_REG16(0x31c0), 0x00c8 },
++	{ CCI_REG16(0x1006), 0x0004 },
++};
++
++/*
++ * 4608x3456 full resolution, 4 lanes, from
++ * sensor_3p8sp_setfile_A_4608x3456_30fps[]. Includes the PLL block
++ * (0x0300..0x030E) and the frame/line length (0x0340/0x0342). 0x0136 is
++ * the only value adapted from the 26 MHz source to 24 MHz; see the file
++ * header.
++ */
++static const struct cci_reg_sequence mode_4608x3456_regs[] = {
++	{ CCI_REG16(0x6028), 0x2000 },
++	{ CCI_REG16(0x0136), 0x1800 },	/* EXCK_FREQ 24.0MHz (m1721; setfile src 0x1A00/26MHz) */
++	{ CCI_REG16(0x0304), 0x0007 },
++	{ CCI_REG16(0x0306), 0x0071 },
++	{ CCI_REG16(0x0302), 0x0001 },
++	{ CCI_REG16(0x0300), 0x0003 },
++	{ CCI_REG16(0x030c), 0x0004 },
++	{ CCI_REG16(0x030e), 0x0069 },
++	{ CCI_REG16(0x030a), 0x0001 },
++	{ CCI_REG16(0x0308), 0x0008 },
++	{ CCI_REG16(0x3008), 0x0000 },
++	{ CCI_REG16(0x301c), 0x4396 },
++	{ CCI_REG16(0x301e), 0x0000 },
++	{ CCI_REG16(0x0344), 0x0018 },
++	{ CCI_REG16(0x0346), 0x0018 },
++	{ CCI_REG16(0x0348), 0x1217 },
++	{ CCI_REG16(0x034a), 0x0d97 },
++	{ CCI_REG16(0x034c), 0x1200 },
++	{ CCI_REG16(0x034e), 0x0d80 },
++	{ CCI_REG16(0x0408), 0x0000 },
++	{ CCI_REG16(0x0900), 0x0011 },
++	{ CCI_REG16(0x0380), 0x0001 },
++	{ CCI_REG16(0x0382), 0x0001 },
++	{ CCI_REG16(0x0384), 0x0001 },
++	{ CCI_REG16(0x0386), 0x0001 },
++	{ CCI_REG16(0x0400), 0x0000 },
++	{ CCI_REG16(0x0404), 0x0010 },
++	{ CCI_REG16(0x0342), 0x1400 },
++	{ CCI_REG16(0x0340), 0x0e1a },
++	{ CCI_REG16(0x602a), 0x1704 },
++	{ CCI_REG16(0x6f12), 0x8010 },
++	{ CCI_REG16(0x317a), 0x0130 },
++	{ CCI_REG16(0x31a4), 0x0102 },
++	{ CCI_REG16(0x36c4), 0x0000 },
++	{ CCI_REG16(0x36c6), 0x0000 },
++	{ CCI_REG16(0x36c8), 0x0000 },
++	{ CCI_REG16(0x36ca), 0x0000 },
++	{ CCI_REG16(0x36cc), 0x0000 },
++	{ CCI_REG16(0x36ce), 0x0000 },
++	{ CCI_REG16(0x36d0), 0x0000 },
++	{ CCI_REG16(0x36d2), 0x0000 },
++	{ CCI_REG16(0x36d4), 0x0000 },
++	{ CCI_REG16(0x36d6), 0x0000 },
++	{ CCI_REG16(0x36d8), 0x0000 },
++	{ CCI_REG16(0x36da), 0x0000 },
++	{ CCI_REG16(0x36dc), 0x0000 },
++	{ CCI_REG16(0x36de), 0x0000 },
++	{ CCI_REG16(0x36e0), 0x0000 },
++	{ CCI_REG16(0x36e2), 0x0000 },
++};
++
++/*
++ * 2304x1728, 2x2 binned, 4 lanes, from
++ * sensor_3p8sp_setfile_A_2304x1728_30fps[]. 0x0136 adapted to 24 MHz as
++ * above; PLL secnd_pll_multiplier (0x030E) = 0x37 gives the lower (binned)
++ * MIPI rate.
++ */
++static const struct cci_reg_sequence mode_2304x1728_regs[] = {
++	{ CCI_REG16(0x6028), 0x2000 },
++	{ CCI_REG16(0x0136), 0x1800 },	/* EXCK_FREQ 24.0MHz (m1721; setfile src 0x1A00/26MHz) */
++	{ CCI_REG16(0x0304), 0x0007 },
++	{ CCI_REG16(0x0306), 0x0071 },
++	{ CCI_REG16(0x0302), 0x0001 },
++	{ CCI_REG16(0x0300), 0x0003 },
++	{ CCI_REG16(0x030c), 0x0004 },
++	{ CCI_REG16(0x030e), 0x0037 },
++	{ CCI_REG16(0x030a), 0x0001 },
++	{ CCI_REG16(0x0308), 0x0008 },
++	{ CCI_REG16(0x3008), 0x0000 },
++	{ CCI_REG16(0x301c), 0x4396 },
++	{ CCI_REG16(0x301e), 0x0000 },
++	{ CCI_REG16(0x0344), 0x0018 },
++	{ CCI_REG16(0x0346), 0x0018 },
++	{ CCI_REG16(0x0348), 0x1217 },
++	{ CCI_REG16(0x034a), 0x0d97 },
++	{ CCI_REG16(0x034c), 0x0900 },
++	{ CCI_REG16(0x034e), 0x06c0 },
++	{ CCI_REG16(0x0408), 0x0000 },
++	{ CCI_REG16(0x0900), 0x0112 },
++	{ CCI_REG16(0x0380), 0x0001 },
++	{ CCI_REG16(0x0382), 0x0001 },
++	{ CCI_REG16(0x0384), 0x0003 },
++	{ CCI_REG16(0x0386), 0x0001 },
++	{ CCI_REG16(0x0400), 0x0001 },
++	{ CCI_REG16(0x0404), 0x0020 },
++	{ CCI_REG16(0x0342), 0x1400 },
++	{ CCI_REG16(0x0340), 0x0e1a },
++	{ CCI_REG16(0x602a), 0x1704 },
++	{ CCI_REG16(0x6f12), 0x8011 },
++	{ CCI_REG16(0x317a), 0x0007 },
++	{ CCI_REG16(0x31a4), 0x0102 },
++	{ CCI_REG16(0x36c4), 0xffcd },
++	{ CCI_REG16(0x36c6), 0xffcd },
++	{ CCI_REG16(0x36c8), 0xffcd },
++	{ CCI_REG16(0x36ca), 0xffcd },
++	{ CCI_REG16(0x36cc), 0xffcd },
++	{ CCI_REG16(0x36ce), 0xffcd },
++	{ CCI_REG16(0x36d0), 0xffcd },
++	{ CCI_REG16(0x36d2), 0xffcd },
++	{ CCI_REG16(0x36d4), 0xffcd },
++	{ CCI_REG16(0x36d6), 0xffcd },
++	{ CCI_REG16(0x36d8), 0xffcd },
++	{ CCI_REG16(0x36da), 0xffcd },
++	{ CCI_REG16(0x36dc), 0xffcd },
++	{ CCI_REG16(0x36de), 0xffcd },
++	{ CCI_REG16(0x36e0), 0xffcd },
++	{ CCI_REG16(0x36e2), 0xffcd },
++};
++
++/*
++ * Supported formats. Four entries per format cover the flip combinations in the
++ * order: no flip, h flip, v flip, h&v flips. The base Bayer order is SGRBG10,
++ * the common Samsung ISOCELL default.
++ */
++static const u32 codes[] = {
++	MEDIA_BUS_FMT_SGRBG10_1X10,
++	MEDIA_BUS_FMT_SRGGB10_1X10,
++	MEDIA_BUS_FMT_SBGGR10_1X10,
++	MEDIA_BUS_FMT_SGBRG10_1X10,
++};
++
++static const char * const s5k3p8sp_test_pattern_menu[] = {
++	"Disabled",
++	"Solid Colour",
++	"Eight Vertical Colour Bars",
++	"Colour Bars With Fade to Grey",
++	"Pseudorandom Sequence (PN9)",
++};
++
++/* regulator supplies -- match the DT: vana/vdig/vio */
++static const char * const s5k3p8sp_supply_name[] = {
++	"vana",	/* Analog 2.8V -- GPIO load-switch (tlmm36) on m1721 */
++	"vdig",	/* Digital core 1.025V -- pm8953_l2 */
++	"vio",	/* Interface 1.8V -- pm8953_l6 */
++};
++
++#define S5K3P8SP_NUM_SUPPLIES ARRAY_SIZE(s5k3p8sp_supply_name)
++
++enum {
++	S5K3P8SP_LINK_FREQ_FULL,
++	S5K3P8SP_LINK_FREQ_BINNED,
++};
++
++/*
++ * MIPI D-PHY link (clock-lane) frequencies. The setfile PLL
++ * (secnd_pre_pll_clk_div 0x04, secnd_pll_multiplier 0x69 full / 0x37 binned,
++ * op_sys_clk_div 0x01) yields a per-lane DDR data rate of 2 * MCLK/4 * mult;
++ * at MCLK = 24 MHz that is 1260 Mbps (full) / 660 Mbps (binned), and the
++ * link (clock-lane) frequency is half of that. The DT endpoint
++ * link-frequencies must match these values.
++ */
++static const s64 link_freq_menu_items[] = {
++	[S5K3P8SP_LINK_FREQ_FULL]   = 630000000ULL,	/* 1260 Mbps/lane @ 24 MHz */
++	[S5K3P8SP_LINK_FREQ_BINNED] = 330000000ULL,	/*  660 Mbps/lane @ 24 MHz */
++};
++
++#define REGS(_list) { .num_of_regs = ARRAY_SIZE(_list), .regs = _list }
++
++static const struct s5k3p8sp_link_freq_config link_freq_configs[] = {
++	[S5K3P8SP_LINK_FREQ_FULL] = {
++		.pixels_per_line = S5K3P8SP_PPL_DEFAULT,
++	},
++	[S5K3P8SP_LINK_FREQ_BINNED] = {
++		.pixels_per_line = S5K3P8SP_PPL_DEFAULT,
++	},
++};
++
++static const struct s5k3p8sp_mode supported_modes[] = {
++	{
++		.width = 4608,
++		.height = 3456,
++		.vts_def = S5K3P8SP_VTS_30FPS,
++		.vts_min = S5K3P8SP_VTS_30FPS,
++		.link_freq_index = S5K3P8SP_LINK_FREQ_FULL,
++		.reg_list = REGS(mode_4608x3456_regs),
++		.crop = {
++			.left = S5K3P8SP_PIXEL_ARRAY_LEFT,
++			.top = S5K3P8SP_PIXEL_ARRAY_TOP,
++			.width = S5K3P8SP_PIXEL_ARRAY_WIDTH,
++			.height = S5K3P8SP_PIXEL_ARRAY_HEIGHT,
++		},
++	},
++	{
++		.width = 2304,
++		.height = 1728,
++		.vts_def = S5K3P8SP_VTS_30FPS,
++		.vts_min = S5K3P8SP_VTS_30FPS,
++		.link_freq_index = S5K3P8SP_LINK_FREQ_BINNED,
++		.reg_list = REGS(mode_2304x1728_regs),
++		.crop = {
++			.left = S5K3P8SP_PIXEL_ARRAY_LEFT,
++			.top = S5K3P8SP_PIXEL_ARRAY_TOP,
++			.width = S5K3P8SP_PIXEL_ARRAY_WIDTH,
++			.height = S5K3P8SP_PIXEL_ARRAY_HEIGHT,
++		},
++	},
++};
++
++struct s5k3p8sp {
++	struct device *dev;
++
++	struct v4l2_subdev sd;
++	struct media_pad pad;
++	struct regmap *regmap;
++
++	struct clk *clk;
++	struct gpio_desc *reset_gpio;
++	struct regulator_bulk_data supplies[S5K3P8SP_NUM_SUPPLIES];
++
++	struct v4l2_ctrl_handler ctrl_handler;
++	struct v4l2_ctrl *link_freq;
++	struct v4l2_ctrl *pixel_rate;
++	struct v4l2_ctrl *vblank;
++	struct v4l2_ctrl *hblank;
++	struct v4l2_ctrl *exposure;
++	struct v4l2_ctrl *hflip;
++	struct v4l2_ctrl *vflip;
++
++	const struct s5k3p8sp_mode *cur_mode;
++
++	unsigned long link_freq_bitmap;
++	unsigned int csi2_flags;
++
++	struct mutex mutex;	/* serialize set_fmt / streaming */
++};
++
++static inline struct s5k3p8sp *to_s5k3p8sp(struct v4l2_subdev *_sd)
++{
++	return container_of(_sd, struct s5k3p8sp, sd);
++}
++
++/* pixel_rate = link_freq * 2 * nr_lanes / bits_per_pixel; 4 lanes / 10 bpp. */
++static u64 link_freq_to_pixel_rate(u64 f)
++{
++	f *= 2 * 4;
++	do_div(f, 10);
++
++	return f;
++}
++
++static u32 s5k3p8sp_get_format_code(const struct s5k3p8sp *s5k3p8sp)
++{
++	unsigned int i;
++
++	lockdep_assert_held(&s5k3p8sp->mutex);
++
++	i = (s5k3p8sp->vflip->val ? 2 : 0) | (s5k3p8sp->hflip->val ? 1 : 0);
++
++	return codes[i];
++}
++
++static int s5k3p8sp_open(struct v4l2_subdev *sd, struct v4l2_subdev_fh *fh)
++{
++	struct s5k3p8sp *s5k3p8sp = to_s5k3p8sp(sd);
++	struct v4l2_mbus_framefmt *try_fmt =
++		v4l2_subdev_state_get_format(fh->state, 0);
++	struct v4l2_rect *try_crop;
++
++	try_fmt->width = supported_modes[0].width;
++	try_fmt->height = supported_modes[0].height;
++	try_fmt->code = s5k3p8sp_get_format_code(s5k3p8sp);
++	try_fmt->field = V4L2_FIELD_NONE;
++
++	try_crop = v4l2_subdev_state_get_crop(fh->state, 0);
++	try_crop->left = S5K3P8SP_PIXEL_ARRAY_LEFT;
++	try_crop->top = S5K3P8SP_PIXEL_ARRAY_TOP;
++	try_crop->width = S5K3P8SP_PIXEL_ARRAY_WIDTH;
++	try_crop->height = S5K3P8SP_PIXEL_ARRAY_HEIGHT;
++
++	return 0;
++}
++
++static int s5k3p8sp_update_digital_gain(struct s5k3p8sp *s5k3p8sp, u32 val)
++{
++	int ret = 0;
++
++	cci_write(s5k3p8sp->regmap, S5K3P8SP_REG_GR_DIGITAL_GAIN, val, &ret);
++	cci_write(s5k3p8sp->regmap, S5K3P8SP_REG_GB_DIGITAL_GAIN, val, &ret);
++	cci_write(s5k3p8sp->regmap, S5K3P8SP_REG_R_DIGITAL_GAIN, val, &ret);
++	cci_write(s5k3p8sp->regmap, S5K3P8SP_REG_B_DIGITAL_GAIN, val, &ret);
++
++	return ret;
++}
++
++static void s5k3p8sp_adjust_exposure_range(struct s5k3p8sp *s5k3p8sp)
++{
++	int exposure_max, exposure_def;
++
++	exposure_max = s5k3p8sp->cur_mode->height + s5k3p8sp->vblank->val -
++		       S5K3P8SP_EXPOSURE_OFFSET;
++	exposure_def = min(exposure_max, s5k3p8sp->exposure->val);
++	__v4l2_ctrl_modify_range(s5k3p8sp->exposure, s5k3p8sp->exposure->minimum,
++				 exposure_max, s5k3p8sp->exposure->step,
++				 exposure_def);
++}
++
++/*
++ * The downstream CIS driver sets USE_GROUP_PARAM_HOLD = 0 for this sensor, i.e.
++ * it does NOT use the SMIA++ grouped-parameter-hold (0x0104) around exposure /
++ * gain writes. This driver follows that: single writes, no group hold.
++ */
++static int s5k3p8sp_set_ctrl(struct v4l2_ctrl *ctrl)
++{
++	struct s5k3p8sp *s5k3p8sp =
++		container_of(ctrl->handler, struct s5k3p8sp, ctrl_handler);
++	int ret = 0;
++
++	if (ctrl->id == V4L2_CID_VBLANK)
++		s5k3p8sp_adjust_exposure_range(s5k3p8sp);
++
++	if (pm_runtime_get_if_in_use(s5k3p8sp->dev) == 0)
++		return 0;
++
++	switch (ctrl->id) {
++	case V4L2_CID_ANALOGUE_GAIN:
++		ret = cci_write(s5k3p8sp->regmap, S5K3P8SP_REG_ANALOG_GAIN,
++				ctrl->val, NULL);
++		break;
++	case V4L2_CID_EXPOSURE:
++		ret = cci_write(s5k3p8sp->regmap, S5K3P8SP_REG_EXPOSURE,
++				ctrl->val, NULL);
++		break;
++	case V4L2_CID_DIGITAL_GAIN:
++		ret = s5k3p8sp_update_digital_gain(s5k3p8sp, ctrl->val);
++		break;
++	case V4L2_CID_TEST_PATTERN:
++		ret = cci_write(s5k3p8sp->regmap, S5K3P8SP_REG_TEST_PATTERN,
++				ctrl->val, NULL);
++		break;
++	case V4L2_CID_VBLANK:
++		ret = cci_write(s5k3p8sp->regmap, S5K3P8SP_REG_FLL,
++				s5k3p8sp->cur_mode->height + ctrl->val, NULL);
++		break;
++	case V4L2_CID_VFLIP:
++	case V4L2_CID_HFLIP:
++		ret = cci_write(s5k3p8sp->regmap, S5K3P8SP_REG_ORIENTATION,
++				(s5k3p8sp->hflip->val ? BIT(0) : 0) |
++				(s5k3p8sp->vflip->val ? BIT(1) : 0),
++				NULL);
++		break;
++	default:
++		dev_info(s5k3p8sp->dev,
++			 "ctrl(id:0x%x,val:0x%x) is not handled\n",
++			 ctrl->id, ctrl->val);
++		ret = -EINVAL;
++		break;
++	}
++
++	pm_runtime_put(s5k3p8sp->dev);
++
++	return ret;
++}
++
++static const struct v4l2_ctrl_ops s5k3p8sp_ctrl_ops = {
++	.s_ctrl = s5k3p8sp_set_ctrl,
++};
++
++static int s5k3p8sp_enum_mbus_code(struct v4l2_subdev *sd,
++				   struct v4l2_subdev_state *sd_state,
++				   struct v4l2_subdev_mbus_code_enum *code)
++{
++	struct s5k3p8sp *s5k3p8sp = to_s5k3p8sp(sd);
++
++	if (code->index > 0)
++		return -EINVAL;
++
++	code->code = s5k3p8sp_get_format_code(s5k3p8sp);
++
++	return 0;
++}
++
++static int s5k3p8sp_enum_frame_size(struct v4l2_subdev *sd,
++				    struct v4l2_subdev_state *sd_state,
++				    struct v4l2_subdev_frame_size_enum *fse)
++{
++	struct s5k3p8sp *s5k3p8sp = to_s5k3p8sp(sd);
++
++	if (fse->index >= ARRAY_SIZE(supported_modes))
++		return -EINVAL;
++
++	if (fse->code != s5k3p8sp_get_format_code(s5k3p8sp))
++		return -EINVAL;
++
++	fse->min_width = supported_modes[fse->index].width;
++	fse->max_width = fse->min_width;
++	fse->min_height = supported_modes[fse->index].height;
++	fse->max_height = fse->min_height;
++
++	return 0;
++}
++
++static void s5k3p8sp_update_pad_format(struct s5k3p8sp *s5k3p8sp,
++				       const struct s5k3p8sp_mode *mode,
++				       struct v4l2_subdev_format *fmt)
++{
++	fmt->format.width = mode->width;
++	fmt->format.height = mode->height;
++	fmt->format.code = s5k3p8sp_get_format_code(s5k3p8sp);
++	fmt->format.field = V4L2_FIELD_NONE;
++}
++
++static int __s5k3p8sp_get_pad_format(struct s5k3p8sp *s5k3p8sp,
++				     struct v4l2_subdev_state *sd_state,
++				     struct v4l2_subdev_format *fmt)
++{
++	if (fmt->which == V4L2_SUBDEV_FORMAT_TRY)
++		fmt->format = *v4l2_subdev_state_get_format(sd_state, fmt->pad);
++	else
++		s5k3p8sp_update_pad_format(s5k3p8sp, s5k3p8sp->cur_mode, fmt);
++
++	return 0;
++}
++
++static int s5k3p8sp_get_pad_format(struct v4l2_subdev *sd,
++				   struct v4l2_subdev_state *sd_state,
++				   struct v4l2_subdev_format *fmt)
++{
++	struct s5k3p8sp *s5k3p8sp = to_s5k3p8sp(sd);
++	int ret;
++
++	mutex_lock(&s5k3p8sp->mutex);
++	ret = __s5k3p8sp_get_pad_format(s5k3p8sp, sd_state, fmt);
++	mutex_unlock(&s5k3p8sp->mutex);
++
++	return ret;
++}
++
++static int s5k3p8sp_set_pad_format(struct v4l2_subdev *sd,
++				   struct v4l2_subdev_state *sd_state,
++				   struct v4l2_subdev_format *fmt)
++{
++	struct s5k3p8sp *s5k3p8sp = to_s5k3p8sp(sd);
++	struct v4l2_mbus_framefmt *framefmt;
++	const struct s5k3p8sp_mode *mode;
++	s32 vblank_def;
++	s32 vblank_min;
++	s64 h_blank;
++	s64 pixel_rate;
++	s64 link_freq;
++
++	mutex_lock(&s5k3p8sp->mutex);
++
++	fmt->format.code = s5k3p8sp_get_format_code(s5k3p8sp);
++
++	mode = v4l2_find_nearest_size(supported_modes,
++				      ARRAY_SIZE(supported_modes), width, height,
++				      fmt->format.width, fmt->format.height);
++	s5k3p8sp_update_pad_format(s5k3p8sp, mode, fmt);
++	if (fmt->which == V4L2_SUBDEV_FORMAT_TRY) {
++		framefmt = v4l2_subdev_state_get_format(sd_state, fmt->pad);
++		*framefmt = fmt->format;
++	} else {
++		s5k3p8sp->cur_mode = mode;
++		__v4l2_ctrl_s_ctrl(s5k3p8sp->link_freq, mode->link_freq_index);
++
++		link_freq = link_freq_menu_items[mode->link_freq_index];
++		pixel_rate = link_freq_to_pixel_rate(link_freq);
++		__v4l2_ctrl_modify_range(s5k3p8sp->pixel_rate, pixel_rate,
++					 pixel_rate, 1, pixel_rate);
++
++		vblank_def = s5k3p8sp->cur_mode->vts_def -
++			     s5k3p8sp->cur_mode->height;
++		vblank_min = s5k3p8sp->cur_mode->vts_min -
++			     s5k3p8sp->cur_mode->height;
++		__v4l2_ctrl_modify_range(s5k3p8sp->vblank, vblank_min,
++					 S5K3P8SP_VTS_MAX - s5k3p8sp->cur_mode->height,
++					 1, vblank_def);
++		__v4l2_ctrl_s_ctrl(s5k3p8sp->vblank, vblank_def);
++		h_blank = link_freq_configs[mode->link_freq_index].pixels_per_line -
++			  s5k3p8sp->cur_mode->width;
++		__v4l2_ctrl_modify_range(s5k3p8sp->hblank, h_blank, h_blank, 1,
++					 h_blank);
++	}
++
++	mutex_unlock(&s5k3p8sp->mutex);
++
++	return 0;
++}
++
++static const struct v4l2_rect *
++__s5k3p8sp_get_pad_crop(struct s5k3p8sp *s5k3p8sp,
++			struct v4l2_subdev_state *sd_state,
++			unsigned int pad, enum v4l2_subdev_format_whence which)
++{
++	switch (which) {
++	case V4L2_SUBDEV_FORMAT_TRY:
++		return v4l2_subdev_state_get_crop(sd_state, pad);
++	case V4L2_SUBDEV_FORMAT_ACTIVE:
++		return &s5k3p8sp->cur_mode->crop;
++	}
++
++	return NULL;
++}
++
++static int s5k3p8sp_get_selection(struct v4l2_subdev *sd,
++				  struct v4l2_subdev_state *sd_state,
++				  struct v4l2_subdev_selection *sel)
++{
++	switch (sel->target) {
++	case V4L2_SEL_TGT_CROP: {
++		struct s5k3p8sp *s5k3p8sp = to_s5k3p8sp(sd);
++
++		mutex_lock(&s5k3p8sp->mutex);
++		sel->r = *__s5k3p8sp_get_pad_crop(s5k3p8sp, sd_state, sel->pad,
++						  sel->which);
++		mutex_unlock(&s5k3p8sp->mutex);
++
++		return 0;
++	}
++
++	case V4L2_SEL_TGT_NATIVE_SIZE:
++		sel->r.left = 0;
++		sel->r.top = 0;
++		sel->r.width = S5K3P8SP_NATIVE_WIDTH;
++		sel->r.height = S5K3P8SP_NATIVE_HEIGHT;
++
++		return 0;
++
++	case V4L2_SEL_TGT_CROP_DEFAULT:
++	case V4L2_SEL_TGT_CROP_BOUNDS:
++		sel->r.left = S5K3P8SP_PIXEL_ARRAY_LEFT;
++		sel->r.top = S5K3P8SP_PIXEL_ARRAY_TOP;
++		sel->r.width = S5K3P8SP_PIXEL_ARRAY_WIDTH;
++		sel->r.height = S5K3P8SP_PIXEL_ARRAY_HEIGHT;
++
++		return 0;
++	}
++
++	return -EINVAL;
++}
++
++static int s5k3p8sp_start_streaming(struct s5k3p8sp *s5k3p8sp)
++{
++	const struct s5k3p8sp_reg_list *reg_list;
++	int ret = 0;
++
++	/*
++	 * Boot the sensor's internal controller and let its firmware settle
++	 * for 3 ms before loading the trim block, as the setfile does.
++	 */
++	cci_write(s5k3p8sp->regmap, S5K3P8SP_REG_PAGE_SELECT,
++		  S5K3P8SP_PAGE_CONTROL, &ret);
++	cci_write(s5k3p8sp->regmap, S5K3P8SP_REG_FW_ENABLE, 0x0001, &ret);
++	if (ret) {
++		dev_err(s5k3p8sp->dev, "%s failed to boot sensor fw\n", __func__);
++		return ret;
++	}
++	fsleep(3000);
++
++	/* Global init (trim block) */
++	ret = cci_multi_reg_write(s5k3p8sp->regmap, s5k3p8sp_global_regs,
++				  ARRAY_SIZE(s5k3p8sp_global_regs), NULL);
++	if (ret) {
++		dev_err(s5k3p8sp->dev, "%s failed to set global regs\n", __func__);
++		return ret;
++	}
++
++	/* Mode-specific values: PLL + geometry for the current mode */
++	reg_list = &s5k3p8sp->cur_mode->reg_list;
++	ret = cci_multi_reg_write(s5k3p8sp->regmap, reg_list->regs,
++				  reg_list->num_of_regs, NULL);
++	if (ret) {
++		dev_err(s5k3p8sp->dev, "%s failed to set mode\n", __func__);
++		return ret;
++	}
++
++	ret = __v4l2_ctrl_handler_setup(s5k3p8sp->sd.ctrl_handler);
++	if (ret)
++		return ret;
++
++	/* Stream on (SMIA++ 0x0100 = 1, on the control page) */
++	cci_write(s5k3p8sp->regmap, S5K3P8SP_REG_PAGE_SELECT,
++		  S5K3P8SP_PAGE_CONTROL, &ret);
++	cci_write(s5k3p8sp->regmap, S5K3P8SP_REG_MODE_SELECT,
++		  S5K3P8SP_MODE_STREAMING, &ret);
++
++	return ret;
++}
++
++static int s5k3p8sp_stop_streaming(struct s5k3p8sp *s5k3p8sp)
++{
++	int ret = 0;
++
++	cci_write(s5k3p8sp->regmap, S5K3P8SP_REG_PAGE_SELECT,
++		  S5K3P8SP_PAGE_CONTROL, &ret);
++	cci_write(s5k3p8sp->regmap, S5K3P8SP_REG_MODE_SELECT,
++		  S5K3P8SP_MODE_STANDBY, &ret);
++	if (ret)
++		dev_err(s5k3p8sp->dev, "%s failed to set stream\n", __func__);
++
++	return 0;
++}
++
++static int s5k3p8sp_power_on(struct device *dev)
++{
++	struct v4l2_subdev *sd = dev_get_drvdata(dev);
++	struct s5k3p8sp *s5k3p8sp = to_s5k3p8sp(sd);
++	int ret;
++
++	ret = regulator_bulk_enable(S5K3P8SP_NUM_SUPPLIES, s5k3p8sp->supplies);
++	if (ret) {
++		dev_err(dev, "%s: failed to enable regulators\n", __func__);
++		return ret;
++	}
++
++	ret = clk_prepare_enable(s5k3p8sp->clk);
++	if (ret) {
++		dev_err(dev, "failed to enable clock\n");
++		goto reg_off;
++	}
++
++	/* Release reset (reset-gpios is active low) */
++	gpiod_set_value_cansleep(s5k3p8sp->reset_gpio, 0);
++
++	fsleep(1000);
++
++	return 0;
++
++reg_off:
++	regulator_bulk_disable(S5K3P8SP_NUM_SUPPLIES, s5k3p8sp->supplies);
++
++	return ret;
++}
++
++static int s5k3p8sp_power_off(struct device *dev)
++{
++	struct v4l2_subdev *sd = dev_get_drvdata(dev);
++	struct s5k3p8sp *s5k3p8sp = to_s5k3p8sp(sd);
++
++	gpiod_set_value_cansleep(s5k3p8sp->reset_gpio, 1);
++	clk_disable_unprepare(s5k3p8sp->clk);
++	regulator_bulk_disable(S5K3P8SP_NUM_SUPPLIES, s5k3p8sp->supplies);
++
++	return 0;
++}
++
++static int s5k3p8sp_set_stream(struct v4l2_subdev *sd, int enable)
++{
++	struct s5k3p8sp *s5k3p8sp = to_s5k3p8sp(sd);
++	int ret = 0;
++
++	mutex_lock(&s5k3p8sp->mutex);
++
++	if (enable) {
++		ret = pm_runtime_resume_and_get(s5k3p8sp->dev);
++		if (ret < 0)
++			goto err_unlock;
++
++		ret = s5k3p8sp_start_streaming(s5k3p8sp);
++		if (ret)
++			goto err_rpm_put;
++	} else {
++		s5k3p8sp_stop_streaming(s5k3p8sp);
++		pm_runtime_put(s5k3p8sp->dev);
++	}
++
++	mutex_unlock(&s5k3p8sp->mutex);
++
++	return ret;
++
++err_rpm_put:
++	pm_runtime_put(s5k3p8sp->dev);
++err_unlock:
++	mutex_unlock(&s5k3p8sp->mutex);
++
++	return ret;
++}
++
++/* Verify chip ID */
++static int s5k3p8sp_identify_module(struct s5k3p8sp *s5k3p8sp)
++{
++	int ret;
++	u64 val;
++
++	ret = cci_read(s5k3p8sp->regmap, S5K3P8SP_REG_CHIP_ID, &val, NULL);
++	if (ret) {
++		dev_err(s5k3p8sp->dev, "failed to read chip id\n");
++		return ret;
++	}
++
++	if (val != S5K3P8SP_CHIP_ID) {
++		dev_err(s5k3p8sp->dev, "chip id mismatch: got %llx (want %x)\n",
++			val, S5K3P8SP_CHIP_ID);
++		return -EIO;
++	}
++	dev_info(s5k3p8sp->dev, "detected Samsung S5K3P8SP (0x%llx)\n", val);
++
++	return 0;
++}
++
++static const struct v4l2_subdev_video_ops s5k3p8sp_video_ops = {
++	.s_stream = s5k3p8sp_set_stream,
++};
++
++static const struct v4l2_subdev_pad_ops s5k3p8sp_pad_ops = {
++	.enum_mbus_code = s5k3p8sp_enum_mbus_code,
++	.get_fmt = s5k3p8sp_get_pad_format,
++	.set_fmt = s5k3p8sp_set_pad_format,
++	.enum_frame_size = s5k3p8sp_enum_frame_size,
++	.get_selection = s5k3p8sp_get_selection,
++};
++
++static const struct v4l2_subdev_ops s5k3p8sp_subdev_ops = {
++	.video = &s5k3p8sp_video_ops,
++	.pad = &s5k3p8sp_pad_ops,
++};
++
++static const struct v4l2_subdev_internal_ops s5k3p8sp_internal_ops = {
++	.open = s5k3p8sp_open,
++};
++
++static int s5k3p8sp_init_controls(struct s5k3p8sp *s5k3p8sp)
++{
++	struct v4l2_fwnode_device_properties props;
++	struct v4l2_ctrl_handler *ctrl_hdlr;
++	s64 vblank_def;
++	s64 vblank_min;
++	s64 pixel_rate;
++	s64 hblank;
++	int ret;
++
++	ctrl_hdlr = &s5k3p8sp->ctrl_handler;
++	ret = v4l2_ctrl_handler_init(ctrl_hdlr, 11);
++	if (ret)
++		return ret;
++
++	mutex_init(&s5k3p8sp->mutex);
++	ctrl_hdlr->lock = &s5k3p8sp->mutex;
++
++	s5k3p8sp->link_freq =
++		v4l2_ctrl_new_int_menu(ctrl_hdlr, &s5k3p8sp_ctrl_ops,
++				       V4L2_CID_LINK_FREQ,
++				       ARRAY_SIZE(link_freq_menu_items) - 1, 0,
++				       link_freq_menu_items);
++	if (s5k3p8sp->link_freq)
++		s5k3p8sp->link_freq->flags |= V4L2_CTRL_FLAG_READ_ONLY;
++
++	s5k3p8sp->hflip = v4l2_ctrl_new_std(ctrl_hdlr, &s5k3p8sp_ctrl_ops,
++					    V4L2_CID_HFLIP, 0, 1, 1, 0);
++	if (s5k3p8sp->hflip)
++		s5k3p8sp->hflip->flags |= V4L2_CTRL_FLAG_MODIFY_LAYOUT;
++
++	s5k3p8sp->vflip = v4l2_ctrl_new_std(ctrl_hdlr, &s5k3p8sp_ctrl_ops,
++					    V4L2_CID_VFLIP, 0, 1, 1, 0);
++	if (s5k3p8sp->vflip)
++		s5k3p8sp->vflip->flags |= V4L2_CTRL_FLAG_MODIFY_LAYOUT;
++
++	pixel_rate = link_freq_to_pixel_rate(link_freq_menu_items[0]);
++	s5k3p8sp->pixel_rate =
++		v4l2_ctrl_new_std(ctrl_hdlr, &s5k3p8sp_ctrl_ops,
++				  V4L2_CID_PIXEL_RATE, pixel_rate, pixel_rate,
++				  1, pixel_rate);
++
++	vblank_def = s5k3p8sp->cur_mode->vts_def - s5k3p8sp->cur_mode->height;
++	vblank_min = s5k3p8sp->cur_mode->vts_min - s5k3p8sp->cur_mode->height;
++	s5k3p8sp->vblank =
++		v4l2_ctrl_new_std(ctrl_hdlr, &s5k3p8sp_ctrl_ops, V4L2_CID_VBLANK,
++				  vblank_min,
++				  S5K3P8SP_VTS_MAX - s5k3p8sp->cur_mode->height, 1,
++				  vblank_def);
++
++	hblank = link_freq_configs[s5k3p8sp->cur_mode->link_freq_index].pixels_per_line -
++		 s5k3p8sp->cur_mode->width;
++	s5k3p8sp->hblank =
++		v4l2_ctrl_new_std(ctrl_hdlr, &s5k3p8sp_ctrl_ops, V4L2_CID_HBLANK,
++				  hblank, hblank, 1, hblank);
++	if (s5k3p8sp->hblank)
++		s5k3p8sp->hblank->flags |= V4L2_CTRL_FLAG_READ_ONLY;
++
++	s5k3p8sp->exposure =
++		v4l2_ctrl_new_std(ctrl_hdlr, &s5k3p8sp_ctrl_ops, V4L2_CID_EXPOSURE,
++				  S5K3P8SP_EXPOSURE_MIN, S5K3P8SP_EXPOSURE_MAX,
++				  S5K3P8SP_EXPOSURE_STEP, S5K3P8SP_EXPOSURE_DEFAULT);
++
++	v4l2_ctrl_new_std(ctrl_hdlr, &s5k3p8sp_ctrl_ops, V4L2_CID_ANALOGUE_GAIN,
++			  S5K3P8SP_ANA_GAIN_MIN, S5K3P8SP_ANA_GAIN_MAX,
++			  S5K3P8SP_ANA_GAIN_STEP, S5K3P8SP_ANA_GAIN_DEFAULT);
++
++	v4l2_ctrl_new_std(ctrl_hdlr, &s5k3p8sp_ctrl_ops, V4L2_CID_DIGITAL_GAIN,
++			  S5K3P8SP_DGTL_GAIN_MIN, S5K3P8SP_DGTL_GAIN_MAX,
++			  S5K3P8SP_DGTL_GAIN_STEP, S5K3P8SP_DGTL_GAIN_DEFAULT);
++
++	v4l2_ctrl_new_std_menu_items(ctrl_hdlr, &s5k3p8sp_ctrl_ops,
++				     V4L2_CID_TEST_PATTERN,
++				     ARRAY_SIZE(s5k3p8sp_test_pattern_menu) - 1, 0,
++				     0, s5k3p8sp_test_pattern_menu);
++
++	if (ctrl_hdlr->error) {
++		ret = ctrl_hdlr->error;
++		dev_err(s5k3p8sp->dev, "%s control init failed (%d)\n", __func__,
++			ret);
++		goto error;
++	}
++
++	ret = v4l2_fwnode_device_parse(s5k3p8sp->dev, &props);
++	if (ret)
++		goto error;
++
++	ret = v4l2_ctrl_new_fwnode_properties(ctrl_hdlr, &s5k3p8sp_ctrl_ops,
++					      &props);
++	if (ret)
++		goto error;
++
++	s5k3p8sp->sd.ctrl_handler = ctrl_hdlr;
++
++	return 0;
++
++error:
++	v4l2_ctrl_handler_free(ctrl_hdlr);
++	mutex_destroy(&s5k3p8sp->mutex);
++
++	return ret;
++}
++
++static void s5k3p8sp_free_controls(struct s5k3p8sp *s5k3p8sp)
++{
++	v4l2_ctrl_handler_free(s5k3p8sp->sd.ctrl_handler);
++	mutex_destroy(&s5k3p8sp->mutex);
++}
++
++static int s5k3p8sp_get_regulators(struct s5k3p8sp *s5k3p8sp)
++{
++	unsigned int i;
++
++	for (i = 0; i < S5K3P8SP_NUM_SUPPLIES; i++)
++		s5k3p8sp->supplies[i].supply = s5k3p8sp_supply_name[i];
++
++	return devm_regulator_bulk_get(s5k3p8sp->dev, S5K3P8SP_NUM_SUPPLIES,
++				       s5k3p8sp->supplies);
++}
++
++static int s5k3p8sp_probe(struct i2c_client *client)
++{
++	struct s5k3p8sp *s5k3p8sp;
++	struct fwnode_handle *endpoint;
++	struct v4l2_fwnode_endpoint ep = {
++		.bus_type = V4L2_MBUS_CSI2_DPHY,
++	};
++	u32 val = 0;
++	int ret;
++
++	s5k3p8sp = devm_kzalloc(&client->dev, sizeof(*s5k3p8sp), GFP_KERNEL);
++	if (!s5k3p8sp)
++		return -ENOMEM;
++
++	s5k3p8sp->dev = &client->dev;
++
++	s5k3p8sp->regmap = devm_cci_regmap_init_i2c(client, 16);
++	if (IS_ERR(s5k3p8sp->regmap))
++		return dev_err_probe(s5k3p8sp->dev, PTR_ERR(s5k3p8sp->regmap),
++				     "failed to initialize CCI\n");
++
++	ret = s5k3p8sp_get_regulators(s5k3p8sp);
++	if (ret)
++		return dev_err_probe(s5k3p8sp->dev, ret,
++				     "failed to get regulators\n");
++
++	s5k3p8sp->reset_gpio = devm_gpiod_get_optional(s5k3p8sp->dev, "reset",
++						       GPIOD_OUT_HIGH);
++	if (IS_ERR(s5k3p8sp->reset_gpio))
++		return dev_err_probe(s5k3p8sp->dev, PTR_ERR(s5k3p8sp->reset_gpio),
++				     "failed to get reset GPIO\n");
++
++	s5k3p8sp->clk = devm_v4l2_sensor_clk_get_legacy(s5k3p8sp->dev, NULL,
++							false, 0);
++	if (IS_ERR(s5k3p8sp->clk))
++		return dev_err_probe(s5k3p8sp->dev, PTR_ERR(s5k3p8sp->clk),
++				     "error getting clock\n");
++
++	val = clk_get_rate(s5k3p8sp->clk);
++	if (val != 24000000)
++		return dev_err_probe(s5k3p8sp->dev, -EINVAL,
++				     "input clock frequency of %u not supported\n",
++				     val);
++
++	endpoint = fwnode_graph_get_next_endpoint(dev_fwnode(s5k3p8sp->dev), NULL);
++	if (!endpoint)
++		return dev_err_probe(s5k3p8sp->dev, -EINVAL,
++				     "endpoint node not found\n");
++
++	ret = v4l2_fwnode_endpoint_alloc_parse(endpoint, &ep);
++	fwnode_handle_put(endpoint);
++	if (ret)
++		return dev_err_probe(s5k3p8sp->dev, ret,
++				     "parsing endpoint node failed\n");
++
++	ret = v4l2_link_freq_to_bitmap(s5k3p8sp->dev, ep.link_frequencies,
++				       ep.nr_of_link_frequencies,
++				       link_freq_menu_items,
++				       ARRAY_SIZE(link_freq_menu_items),
++				       &s5k3p8sp->link_freq_bitmap);
++	if (ret) {
++		dev_err(s5k3p8sp->dev, "link frequency not supported\n");
++		goto error_endpoint_free;
++	}
++
++	/* This driver only supports the 4-lane configuration */
++	if (ep.bus.mipi_csi2.num_data_lanes != 4) {
++		ret = dev_err_probe(s5k3p8sp->dev, -EINVAL,
++				    "only 4 data lanes are supported, got %u\n",
++				    ep.bus.mipi_csi2.num_data_lanes);
++		goto error_endpoint_free;
++	}
++
++	s5k3p8sp->csi2_flags = ep.bus.mipi_csi2.flags;
++
++	v4l2_i2c_subdev_init(&s5k3p8sp->sd, client, &s5k3p8sp_subdev_ops);
++
++	ret = s5k3p8sp_power_on(s5k3p8sp->dev);
++	if (ret)
++		goto error_endpoint_free;
++
++	ret = s5k3p8sp_identify_module(s5k3p8sp);
++	if (ret)
++		goto error_identify;
++
++	s5k3p8sp->cur_mode = &supported_modes[0];
++
++	ret = s5k3p8sp_init_controls(s5k3p8sp);
++	if (ret)
++		goto error_identify;
++
++	s5k3p8sp->sd.internal_ops = &s5k3p8sp_internal_ops;
++	s5k3p8sp->sd.flags |= V4L2_SUBDEV_FL_HAS_DEVNODE;
++	s5k3p8sp->sd.entity.function = MEDIA_ENT_F_CAM_SENSOR;
++
++	s5k3p8sp->pad.flags = MEDIA_PAD_FL_SOURCE;
++
++	ret = media_entity_pads_init(&s5k3p8sp->sd.entity, 1, &s5k3p8sp->pad);
++	if (ret)
++		goto error_handler_free;
++
++	ret = v4l2_async_register_subdev_sensor(&s5k3p8sp->sd);
++	if (ret < 0)
++		goto error_media_entity;
++
++	pm_runtime_set_active(s5k3p8sp->dev);
++	pm_runtime_enable(s5k3p8sp->dev);
++	pm_runtime_idle(s5k3p8sp->dev);
++	v4l2_fwnode_endpoint_free(&ep);
++
++	return 0;
++
++error_media_entity:
++	media_entity_cleanup(&s5k3p8sp->sd.entity);
++
++error_handler_free:
++	s5k3p8sp_free_controls(s5k3p8sp);
++
++error_identify:
++	s5k3p8sp_power_off(s5k3p8sp->dev);
++
++error_endpoint_free:
++	v4l2_fwnode_endpoint_free(&ep);
++
++	return ret;
++}
++
++static void s5k3p8sp_remove(struct i2c_client *client)
++{
++	struct v4l2_subdev *sd = i2c_get_clientdata(client);
++	struct s5k3p8sp *s5k3p8sp = to_s5k3p8sp(sd);
++
++	v4l2_async_unregister_subdev(sd);
++	media_entity_cleanup(&sd->entity);
++	s5k3p8sp_free_controls(s5k3p8sp);
++
++	pm_runtime_disable(s5k3p8sp->dev);
++	if (!pm_runtime_status_suspended(s5k3p8sp->dev))
++		s5k3p8sp_power_off(s5k3p8sp->dev);
++	pm_runtime_set_suspended(s5k3p8sp->dev);
++}
++
++static const struct dev_pm_ops s5k3p8sp_pm_ops = {
++	SET_RUNTIME_PM_OPS(s5k3p8sp_power_off, s5k3p8sp_power_on, NULL)
++};
++
++static const struct of_device_id s5k3p8sp_dt_ids[] = {
++	{ .compatible = "samsung,s5k3p8sp" },
++	{ /* sentinel */ }
++};
++MODULE_DEVICE_TABLE(of, s5k3p8sp_dt_ids);
++
++static struct i2c_driver s5k3p8sp_i2c_driver = {
++	.driver = {
++		.name = "s5k3p8sp",
++		.pm = &s5k3p8sp_pm_ops,
++		.of_match_table = s5k3p8sp_dt_ids,
++	},
++	.probe = s5k3p8sp_probe,
++	.remove = s5k3p8sp_remove,
++};
++
++module_i2c_driver(s5k3p8sp_i2c_driver);
++
++MODULE_AUTHOR("postmarketOS contributors");
++MODULE_DESCRIPTION("Samsung S5K3P8SP sensor driver");
++MODULE_LICENSE("GPL v2");
+-- 
+2.39.5
+

@@ -1,0 +1,869 @@
+From 3a3c6a095c69b42796ab01c8b8448506624bba97 Mon Sep 17 00:00:00 2001
+From: nomorecoolnicknames <78512247+nomorecoolnicknames@users.noreply.github.com>
+Date: Fri, 10 Jul 2026 14:07:03 -0500
+Subject: [PATCH] arm64: dts: qcom: add Meizu M6 Note (m1721)
+
+Add a device tree for the Meizu M6 Note (m1721) smartphone, based on
+the Qualcomm MSM8953 SoC. It is derived from msm8953-xiaomi-mido.dts,
+which is close in board family, framebuffer layout, touch GPIOs and
+PMIC configuration.
+
+Working functionality:
+- DSI panel (Himax HX8399C, TCL) and simple-framebuffer
+- Focaltech FT5435 touchscreen (via edt-ft5x06, ft5426 protocol)
+- volume keys, hall sensor
+- eMMC, SD card, USB peripheral mode
+- WCN3680 Wi-Fi/Bluetooth and modem remoteproc
+- PMI8950 charger, fuel gauge and WLED backlight
+- PMI8950 SPMI haptics (ERM vibrator)
+- AW2013 notification LED, dual AW36413 rear flash controllers
+- WCD analog/digital audio, CS35L35 speaker amp on Quaternary MI2S
+- ICM-20608-D IMU and LTR-578ALS light/proximity sensor on a
+  bit-banged I2C bus (their native bus is TZ-protected)
+- rear (Sony IMX362) and front (Samsung S5K3P8SP) cameras via
+  CAMSS/CCI
+
+Signed-off-by: nomorecoolnicknames <78512247+nomorecoolnicknames@users.noreply.github.com>
+Assisted-by: Claude (Anthropic)
+---
+ arch/arm64/boot/dts/qcom/Makefile             |   1 +
+ .../boot/dts/qcom/msm8953-meizu-m1721.dts     | 815 ++++++++++++++++++
+ 2 files changed, 816 insertions(+)
+ create mode 100644 arch/arm64/boot/dts/qcom/msm8953-meizu-m1721.dts
+
+diff --git a/arch/arm64/boot/dts/qcom/Makefile b/arch/arm64/boot/dts/qcom/Makefile
+index 686f89458..f8508606b 100644
+--- a/arch/arm64/boot/dts/qcom/Makefile
++++ b/arch/arm64/boot/dts/qcom/Makefile
+@@ -95,6 +95,7 @@ dtb-$(CONFIG_ARCH_QCOM)	+= msm8953-asus-ze552kl.dtb
+ dtb-$(CONFIG_ARCH_QCOM)	+= msm8953-flipkart-rimob.dtb
+ dtb-$(CONFIG_ARCH_QCOM)	+= msm8953-huawei-milan.dtb
+ dtb-$(CONFIG_ARCH_QCOM)	+= msm8953-lenovo-kuntao.dtb
++dtb-$(CONFIG_ARCH_QCOM)	+= msm8953-meizu-m1721.dtb
+ dtb-$(CONFIG_ARCH_QCOM)	+= msm8953-motorola-potter.dtb
+ dtb-$(CONFIG_ARCH_QCOM)	+= msm8953-xiaomi-daisy.dtb
+ dtb-$(CONFIG_ARCH_QCOM)	+= msm8953-xiaomi-mido.dtb
+diff --git a/arch/arm64/boot/dts/qcom/msm8953-meizu-m1721.dts b/arch/arm64/boot/dts/qcom/msm8953-meizu-m1721.dts
+new file mode 100644
+index 000000000..d310cdfe6
+--- /dev/null
++++ b/arch/arm64/boot/dts/qcom/msm8953-meizu-m1721.dts
+@@ -0,0 +1,815 @@
++// SPDX-License-Identifier: BSD-3-Clause
++/*
++ * Meizu M6 Note (m1721)
++ */
++/dts-v1/;
++
++#include "msm8953.dtsi"
++#include "pm8953.dtsi"
++#include "pmi8950.dtsi"
++#include <dt-bindings/leds/common.h>
++
++/delete-node/ &cont_splash_mem;
++/delete-node/ &qseecom_mem;
++
++/ {
++	model = "Meizu M6 Note";
++	compatible = "meizu,m1721", "qcom,msm8953";
++	chassis-type = "handset";
++	qcom,msm-id = <293 0>;
++	qcom,board-id = <11 0>;
++
++	aliases {
++		mmc0 = &sdhc_1;
++		mmc1 = &sdhc_2;
++	};
++
++	chosen {
++		#address-cells = <2>;
++		#size-cells = <2>;
++		ranges;
++
++		framebuffer@90001000 {
++			compatible = "simple-framebuffer";
++			reg = <0 0x90001000 0 (1920 * 1080 * 3)>;
++
++			width = <1080>;
++			height = <1920>;
++			stride = <(1080 * 3)>;
++			format = "r8g8b8";
++
++			power-domains = <&gcc MDSS_GDSC>;
++
++			clocks = <&gcc GCC_MDSS_AHB_CLK>,
++				 <&gcc GCC_MDSS_AXI_CLK>,
++				 <&gcc GCC_MDSS_VSYNC_CLK>,
++				 <&gcc GCC_MDSS_MDP_CLK>,
++				 <&gcc GCC_MDSS_BYTE0_CLK>,
++				 <&gcc GCC_MDSS_PCLK0_CLK>,
++				 <&gcc GCC_MDSS_ESC0_CLK>;
++		};
++	};
++
++	gpio-keys {
++		compatible = "gpio-keys";
++
++		pinctrl-names = "default";
++		pinctrl-0 = <&gpio_key_default>, <&gpio_hall_sensor_default>;
++
++		event-hall-sensor {
++			label = "Hall Effect Sensor";
++			gpios = <&tlmm 13 GPIO_ACTIVE_LOW>;
++			linux,input-type = <EV_SW>;
++			linux,code = <SW_LID>;
++			linux,can-disable;
++		};
++
++		key-volume-up {
++			label = "Volume Up";
++			gpios = <&tlmm 85 GPIO_ACTIVE_LOW>;
++			linux,code = <KEY_VOLUMEUP>;
++		};
++	};
++
++	reserved-memory {
++		qseecom_mem: qseecom@84a00000 {
++			reg = <0x0 0x84a00000 0x0 0x1900000>;
++			no-map;
++		};
++
++		cont_splash_mem: cont-splash@90001000 {
++			reg = <0x0 0x90001000 0x0 (1080 * 1920 * 3)>;
++			no-map;
++		};
++
++		ramoops@9ff00000 {
++			compatible = "ramoops";
++			reg = <0x0 0x9ff00000 0x0 0x00100000>;
++			record-size = <0x20000>;
++			console-size = <0xc0000>;
++			pmsg-size = <0x10000>;
++		};
++	};
++
++	vph_pwr: vph-pwr-regulator {
++		compatible = "regulator-fixed";
++		regulator-name = "vph_pwr";
++		regulator-min-microvolt = <3700000>;
++		regulator-max-microvolt = <3700000>;
++		regulator-always-on;
++		regulator-boot-on;
++	};
++
++	battery: battery {
++		compatible = "simple-battery";
++		charge-full-design-microamp-hours = <4000000>;
++		constant-charge-current-max-microamp = <1000000>;
++		voltage-min-design-microvolt = <3400000>;
++		voltage-max-design-microvolt = <4400000>;
++	};
++
++	/*
++	 * The sensors are proxied through the ADSP/SSC firmware in the stock
++	 * ROM, so their BLSP bus (i2c_4) is TZ-protected and inaccessible to
++	 * the AP. Bit-bang the same pads (gpio14 SDA, gpio15 SCL) instead; TZ
++	 * does not guard the raw GPIOs.
++	 */
++	i2c-sensors {
++		compatible = "i2c-gpio";
++		sda-gpios = <&tlmm 14 (GPIO_ACTIVE_HIGH|GPIO_OPEN_DRAIN)>;
++		scl-gpios = <&tlmm 15 (GPIO_ACTIVE_HIGH|GPIO_OPEN_DRAIN)>;
++		i2c-gpio,delay-us = <2>; /* ~100 kHz */
++		#address-cells = <1>;
++		#size-cells = <0>;
++
++		/*
++		 * Only 0x68 (InvenSense ICM-20608-D, WHO_AM_I 0xae) and 0x53
++		 * (Lite-On LTR-578ALS, PART_ID 0xb1) are populated; there is no
++		 * AP-visible magnetometer.
++		 */
++		imu@68 {
++			compatible = "invensense,icm20608d";
++			reg = <0x68>;
++			vdd-supply = <&pm8953_l10>;
++			vddio-supply = <&pm8953_l6>;
++		};
++
++		light-sensor@53 {
++			compatible = "liteon,ltr578";
++			reg = <0x53>;
++			vdd-supply = <&pm8953_l10>;
++			vddio-supply = <&pm8953_l6>;
++			proximity-near-level = <100>;
++		};
++	};
++};
++
++&hsusb_phy {
++	vdd-supply = <&pm8953_l3>;
++	vdda-pll-supply = <&pm8953_l7>;
++	vdda-phy-dpdm-supply = <&pm8953_l13>;
++
++	status = "okay";
++};
++
++&i2c_6 {
++	status = "okay";
++
++	led-controller@45 {
++		compatible = "awinic,aw2013";
++		reg = <0x45>;
++
++		vcc-supply = <&pm8953_l10>;
++		vio-supply = <&pm8953_l6>;
++
++		#address-cells = <1>;
++		#size-cells = <0>;
++
++		led@0 {
++			reg = <0>;
++			color = <LED_COLOR_ID_WHITE>;
++			function = LED_FUNCTION_INDICATOR;
++			led-max-microamp = <5000>;
++		};
++	};
++
++	/*
++	 * Rear ring flash chip 1 of 2. The strobe pin is unused; the flash
++	 * is fired over I2C.
++	 */
++	aw36413_flash1: flash-led-controller@6b {
++		compatible = "awinic,aw36413";
++		reg = <0x6b>;
++		enable-gpios = <&tlmm 95 GPIO_ACTIVE_HIGH>;
++		strobe-gpios = <&tlmm 96 GPIO_ACTIVE_HIGH>;
++
++		led {
++			function = LED_FUNCTION_FLASH;
++			color = <LED_COLOR_ID_WHITE>;
++			led-sources = <0>, <1>;
++			led-max-microamp = <294000>;
++			flash-max-microamp = <1000000>;
++			flash-max-timeout-us = <400000>;
++		};
++	};
++};
++
++&i2c_5 {
++	status = "okay";
++
++	/* Rear ring flash chip 2 of 2 */
++	aw36413_flash2: flash-led-controller@6b {
++		compatible = "awinic,aw36413";
++		reg = <0x6b>;
++		enable-gpios = <&tlmm 93 GPIO_ACTIVE_HIGH>;
++
++		led {
++			function = LED_FUNCTION_FLASH;
++			color = <LED_COLOR_ID_WHITE>;
++			function-enumerator = <2>;
++			led-sources = <0>, <1>;
++			led-max-microamp = <294000>;
++			flash-max-microamp = <1000000>;
++			flash-max-timeout-us = <400000>;
++		};
++	};
++};
++
++&i2c_3 {
++	status = "okay";
++
++	touchscreen@38 {
++		/*
++		 * The controller is a Focaltech FT5435; ft5426 is the closest
++		 * protocol-compatible id in edt-ft5x06.
++		 */
++		compatible = "focaltech,ft5426";
++		reg = <0x38>;
++
++		interrupt-parent = <&tlmm>;
++		interrupts = <65 IRQ_TYPE_EDGE_FALLING>;
++
++		pinctrl-names = "default";
++		pinctrl-0 = <&ts_reset_active &ts_int_active>;
++
++		reset-gpios = <&tlmm 64 GPIO_ACTIVE_LOW>;
++
++		vcc-supply = <&pm8953_l10>;
++		iovcc-supply = <&pm8953_l6>;
++
++		touchscreen-size-x = <1080>;
++		touchscreen-size-y = <1920>;
++	};
++};
++
++&pm8953_resin {
++	linux,code = <KEY_VOLUMEDOWN>;
++	status = "okay";
++};
++
++&pmi8950_wled {
++	qcom,num-strings = <2>;
++	qcom,current-limit-microamp = <20000>;
++	status = "okay";
++};
++
++&mdss {
++	status = "okay";
++};
++
++&mdss_dsi0 {
++	vdda-supply = <&pm8953_s3>;
++	vddio-supply = <&pm8953_l6>;
++
++	status = "okay";
++
++	panel@0 {
++		compatible = "meizu,m1721-hx8399c-tcl";
++		reg = <0>;
++
++		backlight = <&pmi8950_wled>;
++
++		reset-gpios = <&tlmm 61 GPIO_ACTIVE_LOW>;
++
++		vsp-supply = <&lab>;
++		vsn-supply = <&ibb>;
++
++		port {
++			panel_in: endpoint {
++				remote-endpoint = <&mdss_dsi0_out>;
++			};
++		};
++	};
++};
++
++&mdss_dsi0_out {
++	data-lanes = <0 1 2 3>;
++	remote-endpoint = <&panel_in>;
++};
++
++&mdss_dsi0_phy {
++	vddio-supply = <&pm8953_l6>;
++	vcca-supply = <&pm8953_l3>;
++
++	status = "okay";
++};
++
++&lab {
++	qcom,soft-start-us = <800>;
++};
++
++&ibb {
++	qcom,discharge-resistor-kohms = <32>;
++};
++
++&pmi8950_fg {
++	monitored-battery = <&battery>;
++	power-supplies = <&pmi8950_smbcharger>;
++	status = "okay";
++};
++
++&pmi8950_smbcharger {
++	monitored-battery = <&battery>;
++	status = "okay";
++};
++
++/* PMI8950 SPMI haptics block driving an ERM vibration motor */
++&spmi_bus {
++	pmic@3 {
++		haptics@c000 {
++			compatible = "qcom,pmi8950-haptics", "qcom,spmi-haptics";
++			reg = <0xc000>;
++
++			interrupts = <0x3 0xc0 0x0 IRQ_TYPE_EDGE_BOTH>,
++				     <0x3 0xc0 0x1 IRQ_TYPE_EDGE_BOTH>;
++			interrupt-names = "short", "play";
++
++			qcom,play-mode = <0>;		/* HAP_PLAY_DIRECT */
++			qcom,actuator-type = <1>;	/* HAP_TYPE_ERM */
++			qcom,wave-shape = <1>;		/* HAP_WAVE_SQUARE */
++			qcom,wave-play-rate-us = <6667>;
++			qcom,vmax-millivolt = <3400>;
++			qcom,brake-pattern = <0x3 0x3 0x0 0x0>;
++
++			status = "okay";
++		};
++	};
++};
++
++&lpass {
++	status = "okay";
++};
++
++/* The modem firmware comes from the stock device "modem" partition. */
++&mpss {
++	status = "okay";
++	mss-supply = <&pm8953_s1>;
++	pll-supply = <&pm8953_l7>;
++	firmware-name = "qcom/msm8953/meizu/m1721/mba.mbn",
++			"qcom/msm8953/meizu/m1721/modem.mdt";
++};
++
++&sound_card {
++	model = "meizu-m1721";
++
++	pinctrl-0 = <&cdc_pdm_lines_act &cdc_pdm_lines_2_act &cdc_pdm_comp_lines_act
++		     &sec_mi2s_active &sec_mi2s_mclk_active>;
++	pinctrl-1 = <&cdc_pdm_lines_sus &cdc_pdm_lines_2_sus &cdc_pdm_comp_lines_sus>;
++	pinctrl-names = "default", "sleep";
++
++	status = "okay";
++
++	/*
++	 * The CS35L35 speaker amp is driven by the Quaternary MI2S
++	 * controller routed onto the sec_mi2s pads (gpio135-138, mclk
++	 * gpio25), as on the stock ROM.
++	 */
++	quaternary-mi2s-dai-link {
++		link-name = "Quaternary MI2S";
++		cpu {
++			sound-dai = <&q6afedai QUATERNARY_MI2S_RX>;
++		};
++		platform {
++			sound-dai = <&q6routing>;
++		};
++		codec {
++			sound-dai = <&speaker_amp 0>;
++		};
++	};
++};
++
++&q6afedai {
++	dai@22 {
++		reg = <QUATERNARY_MI2S_RX>;
++		qcom,sd-lines = <0>;
++	};
++};
++
++&wcd_codec {
++	qcom,micbias1-ext-cap;
++
++	/*
++	 * Both the HPHL and GND mechanical switches of the headset jack are
++	 * normally open. Without these properties the MBHC misreads the
++	 * empty jack's resting state as an insertion and reports a phantom
++	 * headphone at boot.
++	 */
++	qcom,hphl-jack-type-normally-open;
++	qcom,gnd-jack-type-normally-open;
++
++	vdd-cdc-io-supply = <&pm8953_l5>;
++	vdd-cdc-tx-rx-cx-supply = <&pm8953_s4>;
++	vdd-micbias-supply = <&pm8953_l13>;
++
++	status = "okay";
++};
++
++&i2c_8 {
++	status = "okay";
++
++	speaker_amp: speaker-amp@40 {
++		compatible = "cirrus,cs35l35";
++		reg = <0x40>;
++
++		reset-gpios = <&tlmm 91 GPIO_ACTIVE_HIGH>;
++		interrupt-parent = <&tlmm>;
++		interrupts = <90 IRQ_TYPE_LEVEL_LOW>;
++
++		VA-supply = <&pm8953_l6>;
++		VP-supply = <&vph_pwr>;
++
++		#sound-dai-cells = <1>;
++		cirrus,boost-ind-nanohenry = <1200>;
++	};
++};
++
++&wcnss {
++	vddpx-supply = <&pm8953_l5>;
++
++	status = "okay";
++};
++
++&wcnss_iris {
++	compatible = "qcom,wcn3680";
++
++	vddxo-supply = <&pm8953_l7>;
++	vddrfa-supply = <&pm8953_l19>;
++	vddpa-supply = <&pm8953_l9>;
++	vdddig-supply = <&pm8953_l5>;
++
++	status = "okay";
++};
++
++&rpm_requests {
++	regulators {
++		compatible = "qcom,rpm-pm8953-regulators";
++
++		vdd_s1-supply = <&vph_pwr>;
++		vdd_s2-supply = <&vph_pwr>;
++		vdd_s3-supply = <&vph_pwr>;
++		vdd_s4-supply = <&vph_pwr>;
++		vdd_s5-supply = <&vph_pwr>;
++		vdd_s6-supply = <&vph_pwr>;
++		vdd_s7-supply = <&vph_pwr>;
++		vdd_l1-supply = <&pm8953_s3>;
++		vdd_l2_l3-supply = <&pm8953_s3>;
++		vdd_l4_l5_l6_l7_l16_l19-supply = <&pm8953_s4>;
++		vdd_l8_l11_l12_l13_l14_l15-supply = <&vph_pwr>;
++		vdd_l9_l10_l17_l18_l22-supply = <&vph_pwr>;
++		vdd_l23-supply = <&pm8953_s3>;
++
++		pm8953_s1: s1 {
++			regulator-min-microvolt = <863000>;
++			regulator-max-microvolt = <1152000>;
++		};
++
++		pm8953_s3: s3 {
++			regulator-min-microvolt = <1224000>;
++			regulator-max-microvolt = <1224000>;
++		};
++
++		pm8953_s4: s4 {
++			regulator-min-microvolt = <1896000>;
++			regulator-max-microvolt = <2048000>;
++		};
++
++		pm8953_l1: l1 {
++			regulator-min-microvolt = <1000000>;
++			regulator-max-microvolt = <1100000>;
++		};
++
++		pm8953_l2: l2 {
++			regulator-min-microvolt = <975000>;
++			regulator-max-microvolt = <1225000>;
++		};
++
++		pm8953_l3: l3 {
++			regulator-min-microvolt = <925000>;
++			regulator-max-microvolt = <925000>;
++			regulator-allow-set-load;
++		};
++
++		pm8953_l5: l5 {
++			regulator-min-microvolt = <1800000>;
++			regulator-max-microvolt = <1800000>;
++		};
++
++		pm8953_l6: l6 {
++			regulator-min-microvolt = <1800000>;
++			regulator-max-microvolt = <1800000>;
++			regulator-always-on;
++		};
++
++		pm8953_l7: l7 {
++			regulator-min-microvolt = <1800000>;
++			regulator-max-microvolt = <1900000>;
++		};
++
++		pm8953_l8: l8 {
++			regulator-min-microvolt = <2900000>;
++			regulator-max-microvolt = <2900000>;
++		};
++
++		pm8953_l9: l9 {
++			regulator-min-microvolt = <3000000>;
++			regulator-max-microvolt = <3300000>;
++		};
++
++		pm8953_l10: l10 {
++			regulator-min-microvolt = <2850000>;
++			regulator-max-microvolt = <2850000>;
++			regulator-always-on;
++		};
++
++		pm8953_l11: l11 {
++			regulator-min-microvolt = <2950000>;
++			regulator-max-microvolt = <2950000>;
++		};
++
++		pm8953_l12: l12 {
++			regulator-min-microvolt = <1800000>;
++			regulator-max-microvolt = <2950000>;
++		};
++
++		pm8953_l13: l13 {
++			regulator-min-microvolt = <3125000>;
++			regulator-max-microvolt = <3125000>;
++		};
++
++		pm8953_l16: l16 {
++			regulator-min-microvolt = <1800000>;
++			regulator-max-microvolt = <1800000>;
++		};
++
++		pm8953_l17: l17 {
++			regulator-min-microvolt = <2850000>;
++			regulator-max-microvolt = <2850000>;
++		};
++
++		pm8953_l19: l19 {
++			regulator-min-microvolt = <1200000>;
++			regulator-max-microvolt = <1350000>;
++		};
++
++		pm8953_l22: l22 {
++			regulator-min-microvolt = <2800000>;
++			regulator-max-microvolt = <2850000>;
++			regulator-always-on;
++		};
++
++		pm8953_l23: l23 {
++			regulator-min-microvolt = <975000>;
++			regulator-max-microvolt = <1225000>;
++		};
++	};
++};
++
++&sdhc_1 {
++	vmmc-supply = <&pm8953_l8>;
++	vqmmc-supply = <&pm8953_l5>;
++
++	status = "okay";
++};
++
++&sdhc_2 {
++	vmmc-supply = <&pm8953_l11>;
++	vqmmc-supply = <&pm8953_l12>;
++
++	cd-gpios = <&tlmm 133 GPIO_ACTIVE_HIGH>;
++
++	pinctrl-names = "default", "sleep";
++	pinctrl-0 = <&sdc2_clk_on &sdc2_cmd_on &sdc2_data_on &sdc2_cd_on>;
++	pinctrl-1 = <&sdc2_clk_off &sdc2_cmd_off &sdc2_data_off &sdc2_cd_off>;
++
++	status = "okay";
++};
++
++&tlmm {
++	/* gpio135-138 carry MI2S for the speaker amp; only gpio0-3 stay reserved */
++	gpio-reserved-ranges = <0 4>;
++
++	sec_mi2s_active: sec-mi2s-active-state {
++		pins = "gpio135", "gpio136", "gpio137", "gpio138";
++		function = "sec_mi2s";
++		drive-strength = <8>;
++		bias-disable;
++	};
++
++	sec_mi2s_mclk_active: sec-mi2s-mclk-active-state {
++		pins = "gpio25";
++		function = "sec_mi2s_mclk_a";
++		drive-strength = <8>;
++		bias-disable;
++	};
++
++	gpio_hall_sensor_default: gpio-hall-sensor-state {
++		pins = "gpio13";
++		function = "gpio";
++		drive-strength = <6>;
++		bias-pull-up;
++	};
++
++	ts_reset_active: ts-reset-active-state {
++		pins = "gpio64";
++		function = "gpio";
++		drive-strength = <8>;
++		bias-pull-up;
++	};
++
++	ts_int_active: ts-int-active-state {
++		pins = "gpio65";
++		function = "gpio";
++		drive-strength = <8>;
++		bias-pull-up;
++	};
++};
++
++&usb3 {
++	/delete-property/ usb-role-switch;
++	dr_mode = "peripheral";
++	status = "okay";
++};
++
++/* ==================== CAMERA (rear IMX362) ==================== */
++
++/ {
++	/*
++	 * 2.8 V analog camera rail: external load-switch gated by TLMM17
++	 * (downstream "sensor_gpio_vana"). Modeled as a fixed regulator so the
++	 * sensor driver's vana-supply request toggles the enable GPIO.
++	 */
++	cam_vana_fixed: regulator-cam-vana {
++		compatible = "regulator-fixed";
++		regulator-name = "cam_vana_2v8";
++		regulator-min-microvolt = <2800000>;
++		regulator-max-microvolt = <2800000>;
++		gpio = <&tlmm 17 GPIO_ACTIVE_HIGH>;
++		enable-active-high;
++		pinctrl-names = "default";
++		pinctrl-0 = <&cam_vana_default>;
++	};
++
++	/* FRONT sensor (s5k3p8sp) 2.8 V analog rail: load-switch on TLMM36 */
++	cam_vana_front_fixed: regulator-cam-vana-front {
++		compatible = "regulator-fixed";
++		regulator-name = "cam_vana_front_2v8";
++		regulator-min-microvolt = <2800000>;
++		regulator-max-microvolt = <2800000>;
++		gpio = <&tlmm 36 GPIO_ACTIVE_HIGH>;
++		enable-active-high;
++		pinctrl-names = "default";
++		pinctrl-0 = <&cam_vana_front_default>;
++	};
++};
++
++&cci {
++	status = "okay";
++	pinctrl-names = "default", "sleep";
++	/* master 0 = rear (imx362), master 1 = front (s5k3p8sp) */
++	pinctrl-0 = <&cci0_default &cci1_default>;
++	pinctrl-1 = <&cci0_sleep &cci1_sleep>;
++};
++
++&camss {
++	status = "okay";
++	vdda-supply = <&pm8953_s3>;
++
++	ports {
++		port@0 {
++			reg = <0>;
++			csiphy0_ep: endpoint {
++				clock-lanes = <1>;
++				data-lanes = <0 1 2 3>;
++				remote-endpoint = <&imx362_ep>;
++			};
++		};
++
++		port@2 {
++			reg = <2>;
++			csiphy2_ep: endpoint {
++				clock-lanes = <1>;
++				data-lanes = <0 1 2 3>;
++				remote-endpoint = <&s5k3p8sp_ep>;
++			};
++		};
++	};
++};
++
++&cci_i2c0 {
++	#address-cells = <1>;
++	#size-cells = <0>;
++
++	camera@10 {
++		compatible = "sony,imx362";
++		reg = <0x10>;
++
++		rotation = <90>;
++		orientation = <1>;
++
++		clocks = <&gcc GCC_CAMSS_MCLK0_CLK>;
++		assigned-clocks = <&gcc GCC_CAMSS_MCLK0_CLK>;
++		assigned-clock-rates = <24000000>;
++
++		reset-gpios = <&tlmm 40 GPIO_ACTIVE_LOW>;
++
++		vana-supply = <&cam_vana_fixed>;
++		vdig-supply = <&pm8953_l2>;
++		vif-supply  = <&pm8953_l6>;
++
++		pinctrl-names = "default", "sleep";
++		pinctrl-0 = <&camss_mclk0_default>;
++		pinctrl-1 = <&camss_mclk0_sleep>;
++
++		port {
++			imx362_ep: endpoint {
++				remote-endpoint = <&csiphy0_ep>;
++				data-lanes = <1 2 3 4>;
++				link-frequencies = /bits/ 64 <636000000 321000000>;
++			};
++		};
++	};
++};
++
++&tlmm {
++	cci0_sleep: cci0-sleep-state {
++		pins = "gpio29", "gpio30";
++		function = "cci_i2c";
++		drive-strength = <2>;
++		bias-pull-up;
++	};
++
++	camss_mclk0_sleep: camss-mclk0-sleep-state {
++		pins = "gpio26";
++		function = "gpio";
++		drive-strength = <2>;
++		bias-pull-down;
++	};
++
++	cam_vana_default: cam-vana-default-state {
++		pins = "gpio17";
++		function = "gpio";
++		drive-strength = <2>;
++		bias-disable;
++	};
++};
++
++/* --- FRONT camera: Samsung S5K3P8SP03 (16 MP) on CCI master 1 / CSIPHY2 --- */
++
++&cci_i2c1 {
++	#address-cells = <1>;
++	#size-cells = <0>;
++
++	camera@10 {
++		compatible = "samsung,s5k3p8sp";
++		reg = <0x10>;
++
++		rotation = <270>;
++		orientation = <0>;
++
++		clocks = <&gcc GCC_CAMSS_MCLK1_CLK>;
++		assigned-clocks = <&gcc GCC_CAMSS_MCLK1_CLK>;
++		assigned-clock-rates = <24000000>;
++
++		reset-gpios = <&tlmm 129 GPIO_ACTIVE_LOW>;
++
++		vana-supply = <&cam_vana_front_fixed>;
++		vdig-supply = <&pm8953_l2>;
++		vio-supply  = <&pm8953_l6>;
++
++		pinctrl-names = "default", "sleep";
++		pinctrl-0 = <&camss_mclk1_default>;
++		pinctrl-1 = <&camss_mclk1_sleep>;
++
++		port {
++			s5k3p8sp_ep: endpoint {
++				remote-endpoint = <&csiphy2_ep>;
++				data-lanes = <1 2 3 4>;
++				/* setfile PLL @ 24 MHz MCLK1: full=630 MHz, binned=330 MHz */
++				link-frequencies = /bits/ 64 <630000000 330000000>;
++			};
++		};
++	};
++};
++
++&tlmm {
++	camss_mclk1_sleep: camss-mclk1-sleep-state {
++		pins = "gpio27";
++		function = "gpio";
++		drive-strength = <2>;
++		bias-pull-down;
++	};
++
++	cci1_sleep: cci1-sleep-state {
++		pins = "gpio31", "gpio32";
++		function = "cci_i2c";
++		drive-strength = <2>;
++		bias-pull-up;
++	};
++
++	cam_vana_front_default: cam-vana-front-default-state {
++		pins = "gpio36";
++		function = "gpio";
++		drive-strength = <2>;
++		bias-disable;
++	};
++};
+-- 
+2.39.5
+

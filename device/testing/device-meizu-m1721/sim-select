@@ -1,0 +1,22 @@
+#!/bin/sh
+# sim-select <1|2> — switch the active SIM slot on m1721 (single-active "DSDS").
+# The mainline QRTR stack has no dual-standby; this rebinds the modem's
+# primary-gw provisioning session to the chosen physical slot. Run as root.
+# Not persistent across reboot (msm-modem-uim-selection re-picks slot 1 at boot).
+set -eu
+T="${1:-}"
+case "$T" in 1|2) ;; *) echo "usage: sim-select <1|2>"; exit 1 ;; esac
+Q="qmicli --silent -pd qrtr://0"
+CARDS=$($Q --uim-get-card-status)
+AID=$(printf '%s' "$CARDS" | awk -v s="$T" '
+  /^Slot \[/ { inslot=($0 ~ ("\\["s"\\]")) }
+  inslot && /Application type:.*usim/ { want=1 }
+  want && /Application ID:/ { getline a; gsub(/^[ \t]+/,"",a); print a; exit }')
+[ -n "$AID" ] || { echo "no usim application present on slot $T"; exit 2; }
+$Q --uim-change-provisioning-session='activate=no,session-type=primary-gw-provisioning' >/dev/null 2>&1 || true
+sleep 1
+$Q --uim-change-provisioning-session="slot=$T,activate=yes,session-type=primary-gw-provisioning,aid=$AID" >/dev/null
+sleep 3
+NOW=$($Q --uim-get-card-status | grep -m1 'Primary GW' | grep -o "slot '[0-9]'")
+OP=$(mmcli -m 0 2>/dev/null | grep -i 'operator name' | head -1 | sed 's/.*: //')
+echo "active $NOW  operator: ${OP:-<registering…>}"

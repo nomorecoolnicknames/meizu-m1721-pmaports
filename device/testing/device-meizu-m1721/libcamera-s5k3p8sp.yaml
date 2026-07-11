@@ -1,0 +1,40 @@
+# SPDX-License-Identifier: CC0-1.0
+#
+# libcamera simple/SoftISP IPA tuning for Samsung S5K3P8SP
+# (Meizu M6 Note m1721 front camera, 16 MP, SGRBG10, 2304x1728 binned mode).
+#
+# Deploy to (first match wins):
+#   /etc/libcamera/ipa/simple/s5k3p8sp.yaml        (preferred, upgrade-safe)
+#   /usr/share/libcamera/ipa/simple/s5k3p8sp.yaml
+#
+# Modeled on the shipped simple-IPA tunings for the same sensor family
+# (s5kjn1.yaml / s5k3l6xx.yaml ship blackLevel: 4096 and the same algorithm
+# list).  blackLevel is on a 16-bit scale: 4096 = 64 at 10 bits, the SMIA
+# pedestal.  Pinning it here disables the histogram-based auto-guess in
+# ipa/simple/algorithms/blc.cpp, which can drift in dark scenes and washes
+# out blacks/colors.
+#
+# NOTE: in this libcamera version the Agc algorithm of the simple IPA has no
+# tuning-file parameters (src/ipa/simple/algorithms/agc.cpp defines no init()
+# knobs).  Exposure/gain behaviour is fixed by code + the CameraSensorHelper;
+# see 0001-libipa-camera_sensor_helper-*.patch for the s5k3p8sp gain model
+# (code = 32 x gain, 0x20..0x200 = 1x..16x).
+%YAML 1.1
+---
+version: 1
+algorithms:
+  - BlackLevel:
+      blackLevel: 4096
+  - Awb:
+  # A color correction matrix would go here once measured for this module.
+  # The CCM algorithm has a significant CPU cost on msm8953 (SoftISP runs on
+  # the CPU), enable only with a real measured matrix:
+  # - Ccm:
+  #     ccms:
+  #       - ct: 6500
+  #         ccm: [ 1, 0, 0,
+  #                0, 1, 0,
+  #                0, 0, 1]
+  - Adjust:
+  - Agc:
+...

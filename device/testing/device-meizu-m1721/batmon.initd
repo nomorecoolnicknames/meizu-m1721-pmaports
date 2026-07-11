@@ -1,0 +1,7 @@
+#!/sbin/openrc-run
+name="batmon"
+description="battery monitor / power-hog sampler"
+command="/usr/bin/batmon"
+command_args="daemon"
+command_background="yes"
+pidfile="/run/batmon.pid"

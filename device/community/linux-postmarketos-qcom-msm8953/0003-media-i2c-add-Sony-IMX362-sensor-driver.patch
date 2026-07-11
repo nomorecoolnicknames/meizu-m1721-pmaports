@@ -1,0 +1,1304 @@
+From 4076b8bdf2e5d8c5d03086baa8ca5c96355bf5a0 Mon Sep 17 00:00:00 2001
+From: nomorecoolnicknames <78512247+nomorecoolnicknames@users.noreply.github.com>
+Date: Fri, 10 Jul 2026 14:09:46 -0500
+Subject: [PATCH] media: i2c: add Sony IMX362 sensor driver
+
+Add a V4L2 subdev driver for the Sony IMX362, the rear-main sensor on
+the Meizu M6 Note (m1721, Qualcomm MSM8953). The module is dual-sourced
+(IMX362 or Samsung S5K2L7); this driver targets the IMX362 variant,
+matched by model id 0x0362 read from register 0x0016.
+
+The IMX362 uses the common Sony smartphone-sensor programming
+interface, so the driver mirrors the mainline IMX258 driver's
+architecture: V4L2 CCI (regmap) register access, PM-runtime power
+(regulators + clk + reset GPIO), v4l2_fwnode CSI-2 DPHY endpoint
+parsing, and the standard control set (exposure 0x0202,
+analogue/digital gain 0x0204/0x020e, test pattern 0x0600,
+vblank/hblank, pixel_rate/link_freq, h/vflip).
+
+Two modes are provided: 4032x3024 full and 2016x1512 2x2 binned.
+
+Register addresses and gain/exposure arithmetic are the Sony IMX
+standard interface (same across IMX214/258/362/386). The downstream
+kernel keeps no register tables (the vendor camera stack supplies them
+from a userspace HAL blob), so the PLL/timing and mode geometry values
+are inherited from the IMX258 24 MHz reference as a structurally valid
+starting point and are commented as needing on-device validation.
+Chip id and hardware parameters (MCLK 24 MHz, supplies, reset/vana
+GPIOs) come from the downstream device tree.
+
+Cross-compiled clean for arm64 (CONFIG_VIDEO_IMX362=m, W=1).
+
+Signed-off-by: nomorecoolnicknames <78512247+nomorecoolnicknames@users.noreply.github.com>
+Assisted-by: Claude (Anthropic)
+---
+ drivers/media/i2c/Kconfig  |   10 +
+ drivers/media/i2c/Makefile |    1 +
+ drivers/media/i2c/imx362.c | 1222 ++++++++++++++++++++++++++++++++++++
+ 3 files changed, 1233 insertions(+)
+ create mode 100644 drivers/media/i2c/imx362.c
+
+diff --git a/drivers/media/i2c/Kconfig b/drivers/media/i2c/Kconfig
+index 98699f32c..8aaf52d1b 100644
+--- a/drivers/media/i2c/Kconfig
++++ b/drivers/media/i2c/Kconfig
+@@ -280,6 +280,16 @@ config VIDEO_IMX355
+ 	  To compile this driver as a module, choose M here: the
+ 	  module will be called imx355.
+ 
++config VIDEO_IMX362
++	tristate "Sony IMX362 sensor support"
++	select V4L2_CCI_I2C
++	help
++	  This is a Video4Linux2 sensor driver for the Sony
++	  IMX362 camera.
++
++	  To compile this driver as a module, choose M here: the
++	  module will be called imx362.
++
+ config VIDEO_IMX412
+ 	tristate "Sony IMX412 sensor support"
+ 	depends on OF_GPIO
+diff --git a/drivers/media/i2c/Makefile b/drivers/media/i2c/Makefile
+index 1e4b5509c..8fc21ee18 100644
+--- a/drivers/media/i2c/Makefile
++++ b/drivers/media/i2c/Makefile
+@@ -59,6 +59,7 @@ obj-$(CONFIG_VIDEO_IMX319) += imx319.o
+ obj-$(CONFIG_VIDEO_IMX334) += imx334.o
+ obj-$(CONFIG_VIDEO_IMX335) += imx335.o
+ obj-$(CONFIG_VIDEO_IMX355) += imx355.o
++obj-$(CONFIG_VIDEO_IMX362) += imx362.o
+ obj-$(CONFIG_VIDEO_IMX412) += imx412.o
+ obj-$(CONFIG_VIDEO_IMX415) += imx415.o
+ obj-$(CONFIG_VIDEO_IR_I2C) += ir-kbd-i2c.o
+diff --git a/drivers/media/i2c/imx362.c b/drivers/media/i2c/imx362.c
+new file mode 100644
+index 000000000..0a2505ac8
+--- /dev/null
++++ b/drivers/media/i2c/imx362.c
+@@ -0,0 +1,1222 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Sony IMX362 CMOS image sensor driver
++ *
++ * Copyright (C) 2026 postmarketOS contributors
++ *
++ * The IMX362 is a 1/2.9", ~12.2 Mpix (4032x3024 effective) dual-photodiode
++ * (2PD) Sony image sensor, found as the rear-main sensor of the Meizu M6
++ * Note (m1721).  The rear module is dual-sourced; some units ship a Samsung
++ * S5K2L7 instead.  This driver targets the IMX362 variant only.
++ *
++ * The register model follows the common Sony smartphone-sensor programming
++ * interface (0x0016 model id, 0x0100 mode select, 0x0202 coarse integration,
++ * 0x0204 analogue gain, 0x0340 frame length, 0x0342 line length, ...), so the
++ * structure is mirrored from the mainline Sony IMX258 driver
++ * (drivers/media/i2c/imx258.c) which uses the same interface.
++ *
++ * The downstream kernel keeps no sensor register tables (the vendor camera
++ * stack supplies them from a userspace HAL blob), so the PLL/timing values
++ * and the exact mode geometry are inherited from the IMX258 24 MHz reference
++ * and still need to be validated against the IMX362 datasheet.
++ */
++
++#include <linux/clk.h>
++#include <linux/delay.h>
++#include <linux/gpio/consumer.h>
++#include <linux/i2c.h>
++#include <linux/module.h>
++#include <linux/pm_runtime.h>
++#include <linux/regulator/consumer.h>
++
++#include <media/v4l2-cci.h>
++#include <media/v4l2-ctrls.h>
++#include <media/v4l2-device.h>
++#include <media/v4l2-fwnode.h>
++
++#define IMX362_REG_MODE_SELECT		CCI_REG8(0x0100)
++#define IMX362_MODE_STANDBY		0x00
++#define IMX362_MODE_STREAMING		0x01
++
++#define IMX362_REG_RESET		CCI_REG8(0x0103)
++
++/*
++ * Grouped parameter hold.  Writing 1 freezes the shadowed exposure/gain
++ * registers; writing 0 latches them all atomically on the next frame
++ * boundary (prevents mid-frame tearing of the multi-byte values).
++ */
++#define IMX362_REG_GROUP_HOLD		CCI_REG8(0x0104)
++
++/* Chip ID */
++#define IMX362_REG_CHIP_ID		CCI_REG16(0x0016)
++#define IMX362_CHIP_ID			0x0362
++
++/*
++ * Some m1721 units report 0x0260 (Sony IMX260); the IMX260 and IMX362
++ * share the same register interface, so accept both.
++ */
++#define IMX260_CHIP_ID			0x0260
++
++/* V_TIMING internal (frame length lines / VTS) */
++#define IMX362_REG_FLL			CCI_REG16(0x0340)
++#define IMX362_VTS_30FPS		0x0c98	/* 3224, full-res default */
++#define IMX362_VTS_30FPS_BINNED		0x064c	/* 1612, binned default */
++#define IMX362_VTS_MAX			0xffff
++
++/* H_TIMING: horizontal blank derived from a fixed line length */
++#define IMX362_PPL_DEFAULT		4256
++
++/* Exposure control (coarse integration time) */
++#define IMX362_REG_EXPOSURE		CCI_REG16(0x0202)
++#define IMX362_EXPOSURE_OFFSET		10
++#define IMX362_EXPOSURE_MIN		4
++#define IMX362_EXPOSURE_STEP		1
++#define IMX362_EXPOSURE_DEFAULT		0x640
++#define IMX362_EXPOSURE_MAX		(IMX362_VTS_MAX - IMX362_EXPOSURE_OFFSET)
++
++/*
++ * Analogue gain control.  Sony gain law: gain = 512 / (512 - code), code range
++ * 0..480 (0dB .. ~20.6dB).  The control value is the raw code, matching the
++ * IMX258 driver.
++ */
++#define IMX362_REG_ANALOG_GAIN		CCI_REG16(0x0204)
++#define IMX362_ANA_GAIN_MIN		0
++#define IMX362_ANA_GAIN_MAX		480
++#define IMX362_ANA_GAIN_STEP		1
++#define IMX362_ANA_GAIN_DEFAULT		0x0
++
++/* Digital gain control (per-channel, 8.8 fixed point, 0x0100 = 1x) */
++#define IMX362_REG_GR_DIGITAL_GAIN	CCI_REG16(0x020e)
++#define IMX362_REG_R_DIGITAL_GAIN	CCI_REG16(0x0210)
++#define IMX362_REG_B_DIGITAL_GAIN	CCI_REG16(0x0212)
++#define IMX362_REG_GB_DIGITAL_GAIN	CCI_REG16(0x0214)
++#define IMX362_DGTL_GAIN_MIN		0
++#define IMX362_DGTL_GAIN_MAX		4096
++/*
++ * Unity digital gain is 0x0100 (256), 8.8 fixed point.  Default to unity
++ * so exposure/analogue gain govern brightness from a neutral baseline.
++ */
++#define IMX362_DGTL_GAIN_DEFAULT	256
++#define IMX362_DGTL_GAIN_STEP		1
++
++/*
++ * Mode-shaping registers on the standard Sony CIS interface, used to force
++ * the die into plain single-exposure RAW readout: HDR mode select 0x0220
++ * (0 = normal, no DOL/HDR) and frame-length auto control 0x0350
++ * (0 = manual VTS from 0x0340).  The die can power up with HDR and
++ * auto-frame-length engaged, in which case coarse integration 0x0202
++ * alone does not govern exposure.
++ */
++#define IMX362_REG_HDR			CCI_REG8(0x0220)
++#define IMX362_REG_FRM_LENGTH_CTL	CCI_REG8(0x0350)
++
++/* Test Pattern Control */
++#define IMX362_REG_TEST_PATTERN		CCI_REG16(0x0600)
++
++/* Orientation */
++#define IMX362_REG_ORIENTATION		CCI_REG8(0x0101)
++
++/* Data format / line length */
++#define IMX362_REG_CSI_DT_FMT		CCI_REG16(0x0112)
++#define IMX362_REG_LINE_LENGTH_PCK	CCI_REG16(0x0342)
++
++/* Frame geometry */
++#define IMX362_REG_X_ADD_STA		CCI_REG16(0x0344)
++#define IMX362_REG_Y_ADD_STA		CCI_REG16(0x0346)
++#define IMX362_REG_X_ADD_END		CCI_REG16(0x0348)
++#define IMX362_REG_Y_ADD_END		CCI_REG16(0x034a)
++#define IMX362_REG_X_OUT_SIZE		CCI_REG16(0x034c)
++#define IMX362_REG_Y_OUT_SIZE		CCI_REG16(0x034e)
++#define IMX362_REG_X_EVN_INC		CCI_REG8(0x0381)
++#define IMX362_REG_X_ODD_INC		CCI_REG8(0x0383)
++#define IMX362_REG_Y_EVN_INC		CCI_REG8(0x0385)
++#define IMX362_REG_Y_ODD_INC		CCI_REG8(0x0387)
++#define IMX362_REG_BINNING_MODE		CCI_REG8(0x0900)
++#define IMX362_REG_BINNING_TYPE		CCI_REG8(0x0901)
++#define IMX362_REG_DIG_CROP_X_OFFSET	CCI_REG16(0x0408)
++#define IMX362_REG_DIG_CROP_Y_OFFSET	CCI_REG16(0x040a)
++#define IMX362_REG_DIG_CROP_IMAGE_WIDTH	CCI_REG16(0x040c)
++#define IMX362_REG_DIG_CROP_IMAGE_HEIGHT CCI_REG16(0x040e)
++#define IMX362_REG_SCALE_MODE		CCI_REG8(0x0401)
++#define IMX362_REG_SCALE_M		CCI_REG16(0x0404)
++
++/* Clock lane control */
++#define IMX362_REG_CSI_LANE_MODE	CCI_REG8(0x0114)
++#define IMX362_REG_EXCK_FREQ		CCI_REG16(0x0136)
++
++/* PLL / clock tree */
++#define IMX362_REG_IVTPXCK_DIV		CCI_REG8(0x0301)
++#define IMX362_REG_IVTSYCK_DIV		CCI_REG8(0x0303)
++#define IMX362_REG_PREPLLCK_VT_DIV	CCI_REG8(0x0305)
++#define IMX362_REG_PLL_IVT_MPY		CCI_REG16(0x0306)
++#define IMX362_REG_IOPPXCK_DIV		CCI_REG8(0x0309)
++#define IMX362_REG_IOPSYCK_DIV		CCI_REG8(0x030b)
++#define IMX362_REG_PREPLLCK_OP_DIV	CCI_REG8(0x030d)
++#define IMX362_REG_PLL_IOP_MPY		CCI_REG16(0x030e)
++#define IMX362_REG_PLL_MULT_DRIV	CCI_REG8(0x0310)
++
++/*
++ * IMX362 native / active pixel array, inferred from the effective
++ * resolution; needs datasheet confirmation.
++ */
++#define IMX362_NATIVE_WIDTH		4056U
++#define IMX362_NATIVE_HEIGHT		3040U
++#define IMX362_PIXEL_ARRAY_LEFT		12U
++#define IMX362_PIXEL_ARRAY_TOP		8U
++#define IMX362_PIXEL_ARRAY_WIDTH	4032U
++#define IMX362_PIXEL_ARRAY_HEIGHT	3024U
++
++struct imx362_reg_list {
++	u32 num_of_regs;
++	const struct cci_reg_sequence *regs;
++};
++
++/* Link frequency config */
++struct imx362_link_freq_config {
++	u32 pixels_per_line;
++	struct imx362_reg_list reg_list;
++};
++
++/* Mode : resolution and related config & values */
++struct imx362_mode {
++	u32 width;
++	u32 height;
++
++	/* V-timing */
++	u32 vts_def;
++	u32 vts_min;
++
++	/* Index of Link frequency config to be used */
++	u32 link_freq_index;
++	/* Default register values for this mode */
++	struct imx362_reg_list reg_list;
++
++	/* Analog crop rectangle */
++	struct v4l2_rect crop;
++};
++
++/*
++ * PLL / clock-tree setup for a 24 MHz external clock, targeting
++ * ~1267 Mbps/lane.  Inherited from the IMX258 24 MHz reference; to be
++ * re-tuned against the IMX362 datasheet.
++ */
++static const struct cci_reg_sequence pll_1267mbps_24mhz[] = {
++	{ IMX362_REG_EXCK_FREQ, 0x1800 },	/* 24.0 MHz */
++	{ IMX362_REG_IVTPXCK_DIV, 5 },
++	{ IMX362_REG_IVTSYCK_DIV, 2 },
++	{ IMX362_REG_PREPLLCK_VT_DIV, 4 },
++	{ IMX362_REG_PLL_IVT_MPY, 212 },
++	{ IMX362_REG_IOPPXCK_DIV, 10 },
++	{ IMX362_REG_IOPSYCK_DIV, 1 },
++	{ IMX362_REG_PREPLLCK_OP_DIV, 2 },
++	{ IMX362_REG_PLL_IOP_MPY, 216 },
++	{ IMX362_REG_PLL_MULT_DRIV, 0 },
++};
++
++static const struct cci_reg_sequence pll_640mbps_24mhz[] = {
++	{ IMX362_REG_EXCK_FREQ, 0x1800 },	/* 24.0 MHz */
++	{ IMX362_REG_IVTPXCK_DIV, 5 },
++	{ IMX362_REG_IVTSYCK_DIV, 2 },
++	{ IMX362_REG_PREPLLCK_VT_DIV, 4 },
++	{ IMX362_REG_PLL_IVT_MPY, 107 },
++	{ IMX362_REG_IOPPXCK_DIV, 10 },
++	{ IMX362_REG_IOPSYCK_DIV, 1 },
++	{ IMX362_REG_PREPLLCK_OP_DIV, 2 },
++	{ IMX362_REG_PLL_IOP_MPY, 216 },
++	{ IMX362_REG_PLL_MULT_DRIV, 0 },
++};
++
++/*
++ * Common settings, applied for every mode before the mode-specific block.
++ * Establishes RAW10 output, 4-lane CSI-2 and a fixed line length.  The
++ * vendor's full recommended register list (image-quality / PDAF tuning)
++ * lives in a userspace HAL blob and is not reproduced here.
++ */
++static const struct cci_reg_sequence mode_common_regs[] = {
++	{ IMX362_REG_CSI_LANE_MODE, 0x03 },	/* 4 data lanes */
++	{ IMX362_REG_CSI_DT_FMT, 0x0a0a },	/* RAW10 */
++	{ IMX362_REG_HDR, 0x00 },		/* single-exposure (no DOL/HDR) */
++	{ IMX362_REG_FRM_LENGTH_CTL, 0x00 },	/* manual VTS from 0x0340 */
++	{ IMX362_REG_LINE_LENGTH_PCK, IMX362_PPL_DEFAULT },
++	{ IMX362_REG_X_EVN_INC, 1 },
++	{ IMX362_REG_X_ODD_INC, 1 },
++	{ IMX362_REG_Y_EVN_INC, 1 },
++	{ IMX362_REG_Y_ODD_INC, 1 },
++	{ IMX362_REG_DIG_CROP_X_OFFSET, 0 },
++	{ IMX362_REG_DIG_CROP_Y_OFFSET, 0 },
++	{ IMX362_REG_GR_DIGITAL_GAIN, 256 },
++	{ IMX362_REG_R_DIGITAL_GAIN, 256 },
++	{ IMX362_REG_B_DIGITAL_GAIN, 256 },
++	{ IMX362_REG_GB_DIGITAL_GAIN, 256 },
++};
++
++/* 4032x3024 full resolution, no binning */
++static const struct cci_reg_sequence mode_4032x3024_regs[] = {
++	{ IMX362_REG_BINNING_MODE, 0 },
++	{ IMX362_REG_BINNING_TYPE, 0x11 },
++	{ IMX362_REG_SCALE_MODE, 0 },
++	{ IMX362_REG_SCALE_M, 16 },
++	{ IMX362_REG_X_ADD_STA, 0 },
++	{ IMX362_REG_Y_ADD_STA, 0 },
++	{ IMX362_REG_X_ADD_END, 4031 },
++	{ IMX362_REG_Y_ADD_END, 3023 },
++	{ IMX362_REG_DIG_CROP_IMAGE_WIDTH, 4032 },
++	{ IMX362_REG_DIG_CROP_IMAGE_HEIGHT, 3024 },
++	{ IMX362_REG_X_OUT_SIZE, 4032 },
++	{ IMX362_REG_Y_OUT_SIZE, 3024 },
++};
++
++/* 2016x1512 2x2 binned */
++static const struct cci_reg_sequence mode_2016x1512_regs[] = {
++	{ IMX362_REG_BINNING_MODE, 1 },
++	{ IMX362_REG_BINNING_TYPE, 0x22 },
++	{ IMX362_REG_SCALE_MODE, 0 },
++	{ IMX362_REG_SCALE_M, 16 },
++	{ IMX362_REG_X_ADD_STA, 0 },
++	{ IMX362_REG_Y_ADD_STA, 0 },
++	{ IMX362_REG_X_ADD_END, 4031 },
++	{ IMX362_REG_Y_ADD_END, 3023 },
++	{ IMX362_REG_DIG_CROP_IMAGE_WIDTH, 2016 },
++	{ IMX362_REG_DIG_CROP_IMAGE_HEIGHT, 1512 },
++	{ IMX362_REG_X_OUT_SIZE, 2016 },
++	{ IMX362_REG_Y_OUT_SIZE, 1512 },
++};
++
++/*
++ * The supported formats.  Four entries per format cover the flip combinations
++ * in the order: no flip, h flip, v flip, h&v flips.
++ */
++/*
++ * Native (no-flip) Bayer order on this sensor is GRBG, verified on-device via
++ * the green-diagonal heuristic on real captures (both full-res and 2x2-binned
++ * read from crop origin 0,0 -> identical phase). hflip/vflip shift the phase as
++ * usual: GRBG -> RGGB (hflip), -> BGGR (vflip), -> GBRG (both).
++ */
++static const u32 codes[] = {
++	MEDIA_BUS_FMT_SGRBG10_1X10,
++	MEDIA_BUS_FMT_SRGGB10_1X10,
++	MEDIA_BUS_FMT_SBGGR10_1X10,
++	MEDIA_BUS_FMT_SGBRG10_1X10,
++};
++
++static const char * const imx362_test_pattern_menu[] = {
++	"Disabled",
++	"Solid Colour",
++	"Eight Vertical Colour Bars",
++	"Colour Bars With Fade to Grey",
++	"Pseudorandom Sequence (PN9)",
++};
++
++/* regulator supplies */
++static const char * const imx362_supply_name[] = {
++	"vana",	/* Analog (2.8V) supply -- GPIO-switched load switch on m1721 */
++	"vdig",	/* Digital core (1.025V) supply -- pm8953_l2 on m1721 */
++	"vif",	/* Interface (1.8V) supply -- pm8953_l6 on m1721 */
++};
++
++#define IMX362_NUM_SUPPLIES ARRAY_SIZE(imx362_supply_name)
++
++enum {
++	IMX362_LINK_FREQ_FULL,
++	IMX362_LINK_FREQ_BINNED,
++};
++
++/*
++ * Menu items for the LINK_FREQ V4L2 control, self-consistent with the PLL
++ * blocks above and the pixel-rate math below (4 lanes, RAW10, D-PHY DDR).
++ */
++static const s64 link_freq_menu_items[] = {
++	636000000ULL,	/* full-res, ~1272 Mbps/lane */
++	321000000ULL,	/* binned,   ~642 Mbps/lane  */
++};
++
++#define REGS(_list) { .num_of_regs = ARRAY_SIZE(_list), .regs = _list }
++
++static const struct imx362_link_freq_config link_freq_configs[] = {
++	[IMX362_LINK_FREQ_FULL] = {
++		.pixels_per_line = IMX362_PPL_DEFAULT,
++		.reg_list = REGS(pll_1267mbps_24mhz),
++	},
++	[IMX362_LINK_FREQ_BINNED] = {
++		.pixels_per_line = IMX362_PPL_DEFAULT,
++		.reg_list = REGS(pll_640mbps_24mhz),
++	},
++};
++
++/* Mode configs */
++static const struct imx362_mode supported_modes[] = {
++	{
++		.width = 4032,
++		.height = 3024,
++		.vts_def = IMX362_VTS_30FPS,
++		.vts_min = IMX362_VTS_30FPS,
++		.link_freq_index = IMX362_LINK_FREQ_FULL,
++		.reg_list = REGS(mode_4032x3024_regs),
++		.crop = {
++			.left = IMX362_PIXEL_ARRAY_LEFT,
++			.top = IMX362_PIXEL_ARRAY_TOP,
++			.width = IMX362_PIXEL_ARRAY_WIDTH,
++			.height = IMX362_PIXEL_ARRAY_HEIGHT,
++		},
++	},
++	{
++		.width = 2016,
++		.height = 1512,
++		.vts_def = IMX362_VTS_30FPS_BINNED,
++		.vts_min = IMX362_VTS_30FPS_BINNED,
++		.link_freq_index = IMX362_LINK_FREQ_BINNED,
++		.reg_list = REGS(mode_2016x1512_regs),
++		.crop = {
++			.left = IMX362_PIXEL_ARRAY_LEFT,
++			.top = IMX362_PIXEL_ARRAY_TOP,
++			.width = IMX362_PIXEL_ARRAY_WIDTH,
++			.height = IMX362_PIXEL_ARRAY_HEIGHT,
++		},
++	},
++};
++
++struct imx362 {
++	struct device *dev;
++
++	struct v4l2_subdev sd;
++	struct media_pad pad;
++	struct regmap *regmap;
++
++	struct clk *clk;
++	struct gpio_desc *reset_gpio;
++	struct regulator_bulk_data supplies[IMX362_NUM_SUPPLIES];
++
++	struct v4l2_ctrl_handler ctrl_handler;
++	/* V4L2 Controls */
++	struct v4l2_ctrl *link_freq;
++	struct v4l2_ctrl *pixel_rate;
++	struct v4l2_ctrl *vblank;
++	struct v4l2_ctrl *hblank;
++	struct v4l2_ctrl *exposure;
++	struct v4l2_ctrl *hflip;
++	struct v4l2_ctrl *vflip;
++
++	/* Current mode */
++	const struct imx362_mode *cur_mode;
++
++	unsigned long link_freq_bitmap;
++	unsigned int csi2_flags;
++
++	/*
++	 * Mutex for serialized access:
++	 * Protect sensor module set pad format and start/stop streaming safely.
++	 */
++	struct mutex mutex;
++};
++
++static inline struct imx362 *to_imx362(struct v4l2_subdev *_sd)
++{
++	return container_of(_sd, struct imx362, sd);
++}
++
++/*
++ * Pixel rate from link frequency, assuming RAW10 over D-PHY DDR:
++ *   pixel_rate = link_freq * 2 * nr_lanes / bits_per_pixel
++ * Fixed to 4 lanes / 10 bpp for this port.
++ */
++static u64 link_freq_to_pixel_rate(u64 f)
++{
++	f *= 2 * 4;
++	do_div(f, 10);
++
++	return f;
++}
++
++/* Get bayer order based on flip setting. */
++static u32 imx362_get_format_code(const struct imx362 *imx362)
++{
++	unsigned int i;
++
++	lockdep_assert_held(&imx362->mutex);
++
++	i = (imx362->vflip->val ? 2 : 0) | (imx362->hflip->val ? 1 : 0);
++
++	return codes[i];
++}
++
++/* Open sub-device */
++static int imx362_open(struct v4l2_subdev *sd, struct v4l2_subdev_fh *fh)
++{
++	struct imx362 *imx362 = to_imx362(sd);
++	struct v4l2_mbus_framefmt *try_fmt =
++		v4l2_subdev_state_get_format(fh->state, 0);
++	struct v4l2_rect *try_crop;
++
++	/* Initialize try_fmt */
++	try_fmt->width = supported_modes[0].width;
++	try_fmt->height = supported_modes[0].height;
++	try_fmt->code = imx362_get_format_code(imx362);
++	try_fmt->field = V4L2_FIELD_NONE;
++
++	/* Initialize try_crop */
++	try_crop = v4l2_subdev_state_get_crop(fh->state, 0);
++	try_crop->left = IMX362_PIXEL_ARRAY_LEFT;
++	try_crop->top = IMX362_PIXEL_ARRAY_TOP;
++	try_crop->width = IMX362_PIXEL_ARRAY_WIDTH;
++	try_crop->height = IMX362_PIXEL_ARRAY_HEIGHT;
++
++	return 0;
++}
++
++static int imx362_update_digital_gain(struct imx362 *imx362, u32 val)
++{
++	int ret = 0;
++
++	cci_write(imx362->regmap, IMX362_REG_GR_DIGITAL_GAIN, val, &ret);
++	cci_write(imx362->regmap, IMX362_REG_GB_DIGITAL_GAIN, val, &ret);
++	cci_write(imx362->regmap, IMX362_REG_R_DIGITAL_GAIN, val, &ret);
++	cci_write(imx362->regmap, IMX362_REG_B_DIGITAL_GAIN, val, &ret);
++
++	return ret;
++}
++
++static void imx362_adjust_exposure_range(struct imx362 *imx362)
++{
++	int exposure_max, exposure_def;
++
++	/* Honour the VBLANK limits when setting exposure. */
++	exposure_max = imx362->cur_mode->height + imx362->vblank->val -
++		       IMX362_EXPOSURE_OFFSET;
++	exposure_def = min(exposure_max, imx362->exposure->val);
++	__v4l2_ctrl_modify_range(imx362->exposure, imx362->exposure->minimum,
++				 exposure_max, imx362->exposure->step,
++				 exposure_def);
++}
++
++static int imx362_set_ctrl(struct v4l2_ctrl *ctrl)
++{
++	struct imx362 *imx362 =
++		container_of(ctrl->handler, struct imx362, ctrl_handler);
++	int ret = 0;
++
++	/*
++	 * The VBLANK control may change the limits of usable exposure, so check
++	 * and adjust if necessary.
++	 */
++	if (ctrl->id == V4L2_CID_VBLANK)
++		imx362_adjust_exposure_range(imx362);
++
++	/*
++	 * Applying V4L2 control value only happens
++	 * when power is up for streaming
++	 */
++	if (pm_runtime_get_if_in_use(imx362->dev) == 0)
++		return 0;
++
++	switch (ctrl->id) {
++	case V4L2_CID_ANALOGUE_GAIN:
++		/* Latch under grouped hold; always release (NULL) even on error. */
++		cci_write(imx362->regmap, IMX362_REG_GROUP_HOLD, 1, &ret);
++		cci_write(imx362->regmap, IMX362_REG_ANALOG_GAIN, ctrl->val, &ret);
++		cci_write(imx362->regmap, IMX362_REG_GROUP_HOLD, 0, NULL);
++		break;
++	case V4L2_CID_EXPOSURE:
++		cci_write(imx362->regmap, IMX362_REG_GROUP_HOLD, 1, &ret);
++		cci_write(imx362->regmap, IMX362_REG_EXPOSURE, ctrl->val, &ret);
++		cci_write(imx362->regmap, IMX362_REG_GROUP_HOLD, 0, NULL);
++		break;
++	case V4L2_CID_DIGITAL_GAIN:
++		cci_write(imx362->regmap, IMX362_REG_GROUP_HOLD, 1, &ret);
++		ret = imx362_update_digital_gain(imx362, ctrl->val);
++		cci_write(imx362->regmap, IMX362_REG_GROUP_HOLD, 0, NULL);
++		break;
++	case V4L2_CID_TEST_PATTERN:
++		ret = cci_write(imx362->regmap, IMX362_REG_TEST_PATTERN,
++				ctrl->val, NULL);
++		break;
++	case V4L2_CID_VBLANK:
++		ret = cci_write(imx362->regmap, IMX362_REG_FLL,
++				imx362->cur_mode->height + ctrl->val, NULL);
++		break;
++	case V4L2_CID_VFLIP:
++	case V4L2_CID_HFLIP:
++		ret = cci_write(imx362->regmap, IMX362_REG_ORIENTATION,
++				(imx362->hflip->val ? BIT(0) : 0) |
++				(imx362->vflip->val ? BIT(1) : 0),
++				NULL);
++		break;
++	default:
++		dev_info(imx362->dev,
++			 "ctrl(id:0x%x,val:0x%x) is not handled\n",
++			 ctrl->id, ctrl->val);
++		ret = -EINVAL;
++		break;
++	}
++
++	pm_runtime_put(imx362->dev);
++
++	return ret;
++}
++
++static const struct v4l2_ctrl_ops imx362_ctrl_ops = {
++	.s_ctrl = imx362_set_ctrl,
++};
++
++static int imx362_enum_mbus_code(struct v4l2_subdev *sd,
++				 struct v4l2_subdev_state *sd_state,
++				 struct v4l2_subdev_mbus_code_enum *code)
++{
++	struct imx362 *imx362 = to_imx362(sd);
++
++	/* Only one bayer order (varying with flips) is supported */
++	if (code->index > 0)
++		return -EINVAL;
++
++	code->code = imx362_get_format_code(imx362);
++
++	return 0;
++}
++
++static int imx362_enum_frame_size(struct v4l2_subdev *sd,
++				  struct v4l2_subdev_state *sd_state,
++				  struct v4l2_subdev_frame_size_enum *fse)
++{
++	struct imx362 *imx362 = to_imx362(sd);
++
++	if (fse->index >= ARRAY_SIZE(supported_modes))
++		return -EINVAL;
++
++	if (fse->code != imx362_get_format_code(imx362))
++		return -EINVAL;
++
++	fse->min_width = supported_modes[fse->index].width;
++	fse->max_width = fse->min_width;
++	fse->min_height = supported_modes[fse->index].height;
++	fse->max_height = fse->min_height;
++
++	return 0;
++}
++
++static void imx362_update_pad_format(struct imx362 *imx362,
++				     const struct imx362_mode *mode,
++				     struct v4l2_subdev_format *fmt)
++{
++	fmt->format.width = mode->width;
++	fmt->format.height = mode->height;
++	fmt->format.code = imx362_get_format_code(imx362);
++	fmt->format.field = V4L2_FIELD_NONE;
++}
++
++static int __imx362_get_pad_format(struct imx362 *imx362,
++				   struct v4l2_subdev_state *sd_state,
++				   struct v4l2_subdev_format *fmt)
++{
++	if (fmt->which == V4L2_SUBDEV_FORMAT_TRY)
++		fmt->format = *v4l2_subdev_state_get_format(sd_state, fmt->pad);
++	else
++		imx362_update_pad_format(imx362, imx362->cur_mode, fmt);
++
++	return 0;
++}
++
++static int imx362_get_pad_format(struct v4l2_subdev *sd,
++				 struct v4l2_subdev_state *sd_state,
++				 struct v4l2_subdev_format *fmt)
++{
++	struct imx362 *imx362 = to_imx362(sd);
++	int ret;
++
++	mutex_lock(&imx362->mutex);
++	ret = __imx362_get_pad_format(imx362, sd_state, fmt);
++	mutex_unlock(&imx362->mutex);
++
++	return ret;
++}
++
++static int imx362_set_pad_format(struct v4l2_subdev *sd,
++				 struct v4l2_subdev_state *sd_state,
++				 struct v4l2_subdev_format *fmt)
++{
++	struct imx362 *imx362 = to_imx362(sd);
++	struct v4l2_mbus_framefmt *framefmt;
++	const struct imx362_mode *mode;
++	s32 vblank_def;
++	s32 vblank_min;
++	s64 h_blank;
++	s64 pixel_rate;
++	s64 link_freq;
++
++	mutex_lock(&imx362->mutex);
++
++	fmt->format.code = imx362_get_format_code(imx362);
++
++	mode = v4l2_find_nearest_size(supported_modes,
++				      ARRAY_SIZE(supported_modes), width, height,
++				      fmt->format.width, fmt->format.height);
++	imx362_update_pad_format(imx362, mode, fmt);
++	if (fmt->which == V4L2_SUBDEV_FORMAT_TRY) {
++		framefmt = v4l2_subdev_state_get_format(sd_state, fmt->pad);
++		*framefmt = fmt->format;
++	} else {
++		imx362->cur_mode = mode;
++		__v4l2_ctrl_s_ctrl(imx362->link_freq, mode->link_freq_index);
++
++		link_freq = link_freq_menu_items[mode->link_freq_index];
++		pixel_rate = link_freq_to_pixel_rate(link_freq);
++		__v4l2_ctrl_modify_range(imx362->pixel_rate, pixel_rate,
++					 pixel_rate, 1, pixel_rate);
++
++		/* Update limits and set FPS to default */
++		vblank_def = imx362->cur_mode->vts_def -
++			     imx362->cur_mode->height;
++		vblank_min = imx362->cur_mode->vts_min -
++			     imx362->cur_mode->height;
++		__v4l2_ctrl_modify_range(imx362->vblank, vblank_min,
++					 IMX362_VTS_MAX - imx362->cur_mode->height,
++					 1, vblank_def);
++		__v4l2_ctrl_s_ctrl(imx362->vblank, vblank_def);
++		h_blank = link_freq_configs[mode->link_freq_index].pixels_per_line -
++			  imx362->cur_mode->width;
++		__v4l2_ctrl_modify_range(imx362->hblank, h_blank, h_blank, 1,
++					 h_blank);
++	}
++
++	mutex_unlock(&imx362->mutex);
++
++	return 0;
++}
++
++static const struct v4l2_rect *
++__imx362_get_pad_crop(struct imx362 *imx362,
++		      struct v4l2_subdev_state *sd_state,
++		      unsigned int pad, enum v4l2_subdev_format_whence which)
++{
++	switch (which) {
++	case V4L2_SUBDEV_FORMAT_TRY:
++		return v4l2_subdev_state_get_crop(sd_state, pad);
++	case V4L2_SUBDEV_FORMAT_ACTIVE:
++		return &imx362->cur_mode->crop;
++	}
++
++	return NULL;
++}
++
++static int imx362_get_selection(struct v4l2_subdev *sd,
++				struct v4l2_subdev_state *sd_state,
++				struct v4l2_subdev_selection *sel)
++{
++	switch (sel->target) {
++	case V4L2_SEL_TGT_CROP: {
++		struct imx362 *imx362 = to_imx362(sd);
++
++		mutex_lock(&imx362->mutex);
++		sel->r = *__imx362_get_pad_crop(imx362, sd_state, sel->pad,
++						sel->which);
++		mutex_unlock(&imx362->mutex);
++
++		return 0;
++	}
++
++	case V4L2_SEL_TGT_NATIVE_SIZE:
++		sel->r.left = 0;
++		sel->r.top = 0;
++		sel->r.width = IMX362_NATIVE_WIDTH;
++		sel->r.height = IMX362_NATIVE_HEIGHT;
++
++		return 0;
++
++	case V4L2_SEL_TGT_CROP_DEFAULT:
++	case V4L2_SEL_TGT_CROP_BOUNDS:
++		sel->r.left = IMX362_PIXEL_ARRAY_LEFT;
++		sel->r.top = IMX362_PIXEL_ARRAY_TOP;
++		sel->r.width = IMX362_PIXEL_ARRAY_WIDTH;
++		sel->r.height = IMX362_PIXEL_ARRAY_HEIGHT;
++
++		return 0;
++	}
++
++	return -EINVAL;
++}
++
++/* Start streaming */
++static int imx362_start_streaming(struct imx362 *imx362)
++{
++	const struct imx362_reg_list *reg_list;
++	int ret;
++
++	/* Software reset to a known state */
++	ret = cci_write(imx362->regmap, IMX362_REG_RESET, 0x01, NULL);
++	if (ret) {
++		dev_err(imx362->dev, "%s failed to reset sensor\n", __func__);
++		return ret;
++	}
++	/* 12 ms is required from software reset to first access */
++	fsleep(12000);
++
++	/* Setup PLL for the current link frequency */
++	reg_list = &link_freq_configs[imx362->cur_mode->link_freq_index].reg_list;
++	ret = cci_multi_reg_write(imx362->regmap, reg_list->regs,
++				  reg_list->num_of_regs, NULL);
++	if (ret) {
++		dev_err(imx362->dev, "%s failed to set plls\n", __func__);
++		return ret;
++	}
++
++	/* Apply common recommended settings */
++	ret = cci_multi_reg_write(imx362->regmap, mode_common_regs,
++				  ARRAY_SIZE(mode_common_regs), NULL);
++	if (ret) {
++		dev_err(imx362->dev, "%s failed to set common regs\n", __func__);
++		return ret;
++	}
++
++	/* Apply mode-specific values */
++	reg_list = &imx362->cur_mode->reg_list;
++	ret = cci_multi_reg_write(imx362->regmap, reg_list->regs,
++				  reg_list->num_of_regs, NULL);
++	if (ret) {
++		dev_err(imx362->dev, "%s failed to set mode\n", __func__);
++		return ret;
++	}
++
++	/* Apply customized values from user */
++	ret = __v4l2_ctrl_handler_setup(imx362->sd.ctrl_handler);
++	if (ret)
++		return ret;
++
++	/* set stream on register */
++	return cci_write(imx362->regmap, IMX362_REG_MODE_SELECT,
++			 IMX362_MODE_STREAMING, NULL);
++}
++
++/* Stop streaming */
++static int imx362_stop_streaming(struct imx362 *imx362)
++{
++	int ret;
++
++	ret = cci_write(imx362->regmap, IMX362_REG_MODE_SELECT,
++			IMX362_MODE_STANDBY, NULL);
++	if (ret)
++		dev_err(imx362->dev, "%s failed to set stream\n", __func__);
++
++	/*
++	 * Return success even if it was an error, as there is nothing the
++	 * caller can do about it.
++	 */
++	return 0;
++}
++
++static int imx362_power_on(struct device *dev)
++{
++	struct v4l2_subdev *sd = dev_get_drvdata(dev);
++	struct imx362 *imx362 = to_imx362(sd);
++	int ret;
++
++	ret = regulator_bulk_enable(IMX362_NUM_SUPPLIES, imx362->supplies);
++	if (ret) {
++		dev_err(dev, "%s: failed to enable regulators\n", __func__);
++		return ret;
++	}
++
++	ret = clk_prepare_enable(imx362->clk);
++	if (ret) {
++		dev_err(dev, "failed to enable clock\n");
++		goto reg_off;
++	}
++
++	/* Release reset (reset-gpios is active low) */
++	gpiod_set_value_cansleep(imx362->reset_gpio, 0);
++
++	/* T4: >= 8 EXCK cycles + settling before first I2C access */
++	fsleep(1000);
++
++	return 0;
++
++reg_off:
++	regulator_bulk_disable(IMX362_NUM_SUPPLIES, imx362->supplies);
++
++	return ret;
++}
++
++static int imx362_power_off(struct device *dev)
++{
++	struct v4l2_subdev *sd = dev_get_drvdata(dev);
++	struct imx362 *imx362 = to_imx362(sd);
++
++	gpiod_set_value_cansleep(imx362->reset_gpio, 1);
++	clk_disable_unprepare(imx362->clk);
++	regulator_bulk_disable(IMX362_NUM_SUPPLIES, imx362->supplies);
++
++	return 0;
++}
++
++static int imx362_set_stream(struct v4l2_subdev *sd, int enable)
++{
++	struct imx362 *imx362 = to_imx362(sd);
++	int ret = 0;
++
++	mutex_lock(&imx362->mutex);
++
++	if (enable) {
++		ret = pm_runtime_resume_and_get(imx362->dev);
++		if (ret < 0)
++			goto err_unlock;
++
++		/*
++		 * Apply default & customized values
++		 * and then start streaming.
++		 */
++		ret = imx362_start_streaming(imx362);
++		if (ret)
++			goto err_rpm_put;
++	} else {
++		imx362_stop_streaming(imx362);
++		pm_runtime_put(imx362->dev);
++	}
++
++	mutex_unlock(&imx362->mutex);
++
++	return ret;
++
++err_rpm_put:
++	pm_runtime_put(imx362->dev);
++err_unlock:
++	mutex_unlock(&imx362->mutex);
++
++	return ret;
++}
++
++/* Verify chip ID */
++static int imx362_identify_module(struct imx362 *imx362)
++{
++	int ret;
++	u64 val;
++
++	ret = cci_read(imx362->regmap, IMX362_REG_CHIP_ID, &val, NULL);
++	if (ret) {
++		dev_err(imx362->dev, "failed to read chip id %x\n",
++			IMX362_CHIP_ID);
++		return ret;
++	}
++
++	if (val != IMX362_CHIP_ID && val != IMX260_CHIP_ID) {
++		dev_err(imx362->dev, "chip id mismatch: got %llx (want %x or %x)\n",
++			val, IMX362_CHIP_ID, IMX260_CHIP_ID);
++		return -EIO;
++	}
++	dev_info(imx362->dev, "detected Sony IMX%llx\n", val);
++
++	return 0;
++}
++
++static const struct v4l2_subdev_video_ops imx362_video_ops = {
++	.s_stream = imx362_set_stream,
++};
++
++static const struct v4l2_subdev_pad_ops imx362_pad_ops = {
++	.enum_mbus_code = imx362_enum_mbus_code,
++	.get_fmt = imx362_get_pad_format,
++	.set_fmt = imx362_set_pad_format,
++	.enum_frame_size = imx362_enum_frame_size,
++	.get_selection = imx362_get_selection,
++};
++
++static const struct v4l2_subdev_ops imx362_subdev_ops = {
++	.video = &imx362_video_ops,
++	.pad = &imx362_pad_ops,
++};
++
++static const struct v4l2_subdev_internal_ops imx362_internal_ops = {
++	.open = imx362_open,
++};
++
++/* Initialize control handlers */
++static int imx362_init_controls(struct imx362 *imx362)
++{
++	struct v4l2_fwnode_device_properties props;
++	struct v4l2_ctrl_handler *ctrl_hdlr;
++	s64 vblank_def;
++	s64 vblank_min;
++	s64 pixel_rate;
++	s64 hblank;
++	int ret;
++
++	ctrl_hdlr = &imx362->ctrl_handler;
++	ret = v4l2_ctrl_handler_init(ctrl_hdlr, 11);
++	if (ret)
++		return ret;
++
++	mutex_init(&imx362->mutex);
++	ctrl_hdlr->lock = &imx362->mutex;
++
++	imx362->link_freq =
++		v4l2_ctrl_new_int_menu(ctrl_hdlr, &imx362_ctrl_ops,
++				       V4L2_CID_LINK_FREQ,
++				       ARRAY_SIZE(link_freq_menu_items) - 1, 0,
++				       link_freq_menu_items);
++	if (imx362->link_freq)
++		imx362->link_freq->flags |= V4L2_CTRL_FLAG_READ_ONLY;
++
++	imx362->hflip = v4l2_ctrl_new_std(ctrl_hdlr, &imx362_ctrl_ops,
++					  V4L2_CID_HFLIP, 0, 1, 1, 0);
++	if (imx362->hflip)
++		imx362->hflip->flags |= V4L2_CTRL_FLAG_MODIFY_LAYOUT;
++
++	imx362->vflip = v4l2_ctrl_new_std(ctrl_hdlr, &imx362_ctrl_ops,
++					  V4L2_CID_VFLIP, 0, 1, 1, 0);
++	if (imx362->vflip)
++		imx362->vflip->flags |= V4L2_CTRL_FLAG_MODIFY_LAYOUT;
++
++	/* By default, PIXEL_RATE is read only */
++	pixel_rate = link_freq_to_pixel_rate(link_freq_menu_items[0]);
++	imx362->pixel_rate =
++		v4l2_ctrl_new_std(ctrl_hdlr, &imx362_ctrl_ops,
++				  V4L2_CID_PIXEL_RATE, pixel_rate, pixel_rate,
++				  1, pixel_rate);
++
++	vblank_def = imx362->cur_mode->vts_def - imx362->cur_mode->height;
++	vblank_min = imx362->cur_mode->vts_min - imx362->cur_mode->height;
++	imx362->vblank =
++		v4l2_ctrl_new_std(ctrl_hdlr, &imx362_ctrl_ops, V4L2_CID_VBLANK,
++				  vblank_min,
++				  IMX362_VTS_MAX - imx362->cur_mode->height, 1,
++				  vblank_def);
++
++	hblank = link_freq_configs[imx362->cur_mode->link_freq_index].pixels_per_line -
++		 imx362->cur_mode->width;
++	imx362->hblank =
++		v4l2_ctrl_new_std(ctrl_hdlr, &imx362_ctrl_ops, V4L2_CID_HBLANK,
++				  hblank, hblank, 1, hblank);
++	if (imx362->hblank)
++		imx362->hblank->flags |= V4L2_CTRL_FLAG_READ_ONLY;
++
++	imx362->exposure =
++		v4l2_ctrl_new_std(ctrl_hdlr, &imx362_ctrl_ops, V4L2_CID_EXPOSURE,
++				  IMX362_EXPOSURE_MIN, IMX362_EXPOSURE_MAX,
++				  IMX362_EXPOSURE_STEP, IMX362_EXPOSURE_DEFAULT);
++
++	v4l2_ctrl_new_std(ctrl_hdlr, &imx362_ctrl_ops, V4L2_CID_ANALOGUE_GAIN,
++			  IMX362_ANA_GAIN_MIN, IMX362_ANA_GAIN_MAX,
++			  IMX362_ANA_GAIN_STEP, IMX362_ANA_GAIN_DEFAULT);
++
++	v4l2_ctrl_new_std(ctrl_hdlr, &imx362_ctrl_ops, V4L2_CID_DIGITAL_GAIN,
++			  IMX362_DGTL_GAIN_MIN, IMX362_DGTL_GAIN_MAX,
++			  IMX362_DGTL_GAIN_STEP, IMX362_DGTL_GAIN_DEFAULT);
++
++	v4l2_ctrl_new_std_menu_items(ctrl_hdlr, &imx362_ctrl_ops,
++				     V4L2_CID_TEST_PATTERN,
++				     ARRAY_SIZE(imx362_test_pattern_menu) - 1, 0,
++				     0, imx362_test_pattern_menu);
++
++	if (ctrl_hdlr->error) {
++		ret = ctrl_hdlr->error;
++		dev_err(imx362->dev, "%s control init failed (%d)\n", __func__,
++			ret);
++		goto error;
++	}
++
++	ret = v4l2_fwnode_device_parse(imx362->dev, &props);
++	if (ret)
++		goto error;
++
++	ret = v4l2_ctrl_new_fwnode_properties(ctrl_hdlr, &imx362_ctrl_ops,
++					      &props);
++	if (ret)
++		goto error;
++
++	imx362->sd.ctrl_handler = ctrl_hdlr;
++
++	return 0;
++
++error:
++	v4l2_ctrl_handler_free(ctrl_hdlr);
++	mutex_destroy(&imx362->mutex);
++
++	return ret;
++}
++
++static void imx362_free_controls(struct imx362 *imx362)
++{
++	v4l2_ctrl_handler_free(imx362->sd.ctrl_handler);
++	mutex_destroy(&imx362->mutex);
++}
++
++static int imx362_get_regulators(struct imx362 *imx362)
++{
++	unsigned int i;
++
++	for (i = 0; i < IMX362_NUM_SUPPLIES; i++)
++		imx362->supplies[i].supply = imx362_supply_name[i];
++
++	return devm_regulator_bulk_get(imx362->dev, IMX362_NUM_SUPPLIES,
++				       imx362->supplies);
++}
++
++static int imx362_probe(struct i2c_client *client)
++{
++	struct imx362 *imx362;
++	struct fwnode_handle *endpoint;
++	struct v4l2_fwnode_endpoint ep = {
++		.bus_type = V4L2_MBUS_CSI2_DPHY,
++	};
++	u32 val = 0;
++	int ret;
++
++	imx362 = devm_kzalloc(&client->dev, sizeof(*imx362), GFP_KERNEL);
++	if (!imx362)
++		return -ENOMEM;
++
++	imx362->dev = &client->dev;
++
++	imx362->regmap = devm_cci_regmap_init_i2c(client, 16);
++	if (IS_ERR(imx362->regmap))
++		return dev_err_probe(imx362->dev, PTR_ERR(imx362->regmap),
++				     "failed to initialize CCI\n");
++
++	ret = imx362_get_regulators(imx362);
++	if (ret)
++		return dev_err_probe(imx362->dev, ret,
++				     "failed to get regulators\n");
++
++	imx362->reset_gpio = devm_gpiod_get_optional(imx362->dev, "reset",
++						     GPIOD_OUT_HIGH);
++	if (IS_ERR(imx362->reset_gpio))
++		return dev_err_probe(imx362->dev, PTR_ERR(imx362->reset_gpio),
++				     "failed to get reset GPIO\n");
++
++	imx362->clk = devm_v4l2_sensor_clk_get_legacy(imx362->dev, NULL, false,
++						      0);
++	if (IS_ERR(imx362->clk))
++		return dev_err_probe(imx362->dev, PTR_ERR(imx362->clk),
++				     "error getting clock\n");
++
++	val = clk_get_rate(imx362->clk);
++	if (val != 24000000)
++		return dev_err_probe(imx362->dev, -EINVAL,
++				     "input clock frequency of %u not supported\n",
++				     val);
++
++	endpoint = fwnode_graph_get_next_endpoint(dev_fwnode(imx362->dev), NULL);
++	if (!endpoint)
++		return dev_err_probe(imx362->dev, -EINVAL,
++				     "endpoint node not found\n");
++
++	ret = v4l2_fwnode_endpoint_alloc_parse(endpoint, &ep);
++	fwnode_handle_put(endpoint);
++	if (ret)
++		return dev_err_probe(imx362->dev, ret,
++				     "parsing endpoint node failed\n");
++
++	ret = v4l2_link_freq_to_bitmap(imx362->dev, ep.link_frequencies,
++				       ep.nr_of_link_frequencies,
++				       link_freq_menu_items,
++				       ARRAY_SIZE(link_freq_menu_items),
++				       &imx362->link_freq_bitmap);
++	if (ret) {
++		dev_err(imx362->dev, "link frequency not supported\n");
++		goto error_endpoint_free;
++	}
++
++	/* This driver only supports the 4-lane configuration */
++	if (ep.bus.mipi_csi2.num_data_lanes != 4) {
++		ret = dev_err_probe(imx362->dev, -EINVAL,
++				    "only 4 data lanes are supported, got %u\n",
++				    ep.bus.mipi_csi2.num_data_lanes);
++		goto error_endpoint_free;
++	}
++
++	imx362->csi2_flags = ep.bus.mipi_csi2.flags;
++
++	/* Initialize subdev */
++	v4l2_i2c_subdev_init(&imx362->sd, client, &imx362_subdev_ops);
++
++	/* Will be powered off via pm_runtime_idle */
++	ret = imx362_power_on(imx362->dev);
++	if (ret)
++		goto error_endpoint_free;
++
++	/* Check module identity */
++	ret = imx362_identify_module(imx362);
++	if (ret)
++		goto error_identify;
++
++	/* Set default mode to max resolution */
++	imx362->cur_mode = &supported_modes[0];
++
++	ret = imx362_init_controls(imx362);
++	if (ret)
++		goto error_identify;
++
++	/* Initialize subdev */
++	imx362->sd.internal_ops = &imx362_internal_ops;
++	imx362->sd.flags |= V4L2_SUBDEV_FL_HAS_DEVNODE;
++	imx362->sd.entity.function = MEDIA_ENT_F_CAM_SENSOR;
++
++	/* Initialize source pad */
++	imx362->pad.flags = MEDIA_PAD_FL_SOURCE;
++
++	ret = media_entity_pads_init(&imx362->sd.entity, 1, &imx362->pad);
++	if (ret)
++		goto error_handler_free;
++
++	ret = v4l2_async_register_subdev_sensor(&imx362->sd);
++	if (ret < 0)
++		goto error_media_entity;
++
++	pm_runtime_set_active(imx362->dev);
++	pm_runtime_enable(imx362->dev);
++	pm_runtime_idle(imx362->dev);
++	v4l2_fwnode_endpoint_free(&ep);
++
++	return 0;
++
++error_media_entity:
++	media_entity_cleanup(&imx362->sd.entity);
++
++error_handler_free:
++	imx362_free_controls(imx362);
++
++error_identify:
++	imx362_power_off(imx362->dev);
++
++error_endpoint_free:
++	v4l2_fwnode_endpoint_free(&ep);
++
++	return ret;
++}
++
++static void imx362_remove(struct i2c_client *client)
++{
++	struct v4l2_subdev *sd = i2c_get_clientdata(client);
++	struct imx362 *imx362 = to_imx362(sd);
++
++	v4l2_async_unregister_subdev(sd);
++	media_entity_cleanup(&sd->entity);
++	imx362_free_controls(imx362);
++
++	pm_runtime_disable(imx362->dev);
++	if (!pm_runtime_status_suspended(imx362->dev))
++		imx362_power_off(imx362->dev);
++	pm_runtime_set_suspended(imx362->dev);
++}
++
++static const struct dev_pm_ops imx362_pm_ops = {
++	SET_RUNTIME_PM_OPS(imx362_power_off, imx362_power_on, NULL)
++};
++
++static const struct of_device_id imx362_dt_ids[] = {
++	{ .compatible = "sony,imx362" },
++	{ /* sentinel */ }
++};
++MODULE_DEVICE_TABLE(of, imx362_dt_ids);
++
++static struct i2c_driver imx362_i2c_driver = {
++	.driver = {
++		.name = "imx362",
++		.pm = &imx362_pm_ops,
++		.of_match_table = imx362_dt_ids,
++	},
++	.probe = imx362_probe,
++	.remove = imx362_remove,
++};
++
++module_i2c_driver(imx362_i2c_driver);
++
++MODULE_AUTHOR("postmarketOS contributors");
++MODULE_DESCRIPTION("Sony IMX362 sensor driver");
++MODULE_LICENSE("GPL v2");
+-- 
+2.39.5
+

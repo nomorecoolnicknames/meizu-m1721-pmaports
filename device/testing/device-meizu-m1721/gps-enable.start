@@ -1,0 +1,4 @@
+#!/bin/sh
+# auto-enable modem GNSS (NMEA+raw) at boot for m1721
+for i in $(seq 1 30); do mmcli -L 2>/dev/null | grep -q Modem/0 && break; sleep 2; done
+mmcli -m 0 --location-enable-gps-nmea --location-enable-gps-raw 2>/dev/null
