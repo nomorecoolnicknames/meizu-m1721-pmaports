@@ -32,22 +32,91 @@ git branch on a fork of the kernel:
 upstream yet, and the two large camera sensor drivers still need a
 `checkpatch.pl --strict` pass before any real submission.
 
-## Firmware (not included)
+## GPU firmware (not included — source it yourself)
 
-The GPU needs proprietary firmware that is **not** redistributed here:
+The Adreno 506 GPU needs two sets of firmware. They are **not** shipped in this
+repo (one is device-signed and not redistributable). Build a local
+`firmware-meizu-m1721` aport out of them.
 
-- **Adreno a530 render microcode** (`a530_pfp.fw`, `a530_pm4.fw`,
-  `a530v3_gpmu.fw2`) — available in the upstream
-  [linux-firmware](https://gitlab.com/kernel-firmware/linux-firmware) `qcom/`
-  directory.
-- **Adreno a506 ZAP shader** (`a506_zap.mdt`/`.b0*`) — Meizu-signed, extract it
-  from the device's stock `/vendor/firmware/` (or the `vendor`/`system`
-  partition). It is device-specific and not freely redistributable.
+### 1. a530 render microcode — redistributable
 
-Provide these to a local `firmware-meizu-m1721` aport (the recipe is
-straightforward: `install -Dm644` each blob under
-`/lib/firmware/qcom/msm8953/meizu/m1721/` and, for a506, the Adreno path
-`/lib/firmware/qcom/a506_zap.*`).
+`a530_pfp.fw`, `a530_pm4.fw`, `a530v3_gpmu.fw2` (the 5xx family shares the a530
+microcode). postmarketOS pulls these automatically through the
+`firmware-qcom-adreno-a530` dependency, so on a normal build you get them for
+free. To fetch them by hand:
+
+```sh
+git clone --depth 1 https://gitlab.com/kernel-firmware/linux-firmware.git
+cp linux-firmware/qcom/a530_pfp.fw \
+   linux-firmware/qcom/a530_pm4.fw \
+   linux-firmware/qcom/a530v3_gpmu.fw2  .
+```
+
+### 2. a506 ZAP shader — Meizu-signed, extract from YOUR device
+
+`a506_zap.mdt` + `a506_zap.b00`/`.b01`/`.b02`. This is signed for this device and
+is **not** in linux-firmware.
+
+**Easiest — grab it from the MeizuCustoms vendor tree** (already extracted):
+
+```sh
+BASE=https://raw.githubusercontent.com/meizucustoms/proprietary_vendor_meizu/lineage-20/m1721/proprietary/vendor/firmware
+for f in a506_zap.mdt a506_zap.b00 a506_zap.b01 a506_zap.b02; do
+	curl -fLO "$BASE/$f"
+done
+```
+
+**Or pull it from your own device's stock Flyme ROM** (rooted stock boot, or an
+extracted `vendor`/`system` image):
+
+```sh
+adb pull /vendor/firmware/a506_zap.mdt      # + .b00 .b01 .b02
+# if the path differs, locate them first:
+adb shell 'find /vendor /system -iname "a506_zap*" 2>/dev/null'
+```
+
+### 3. Package into a `firmware-meizu-m1721` aport
+
+Put all seven blobs beside a new APKBUILD in your pmaports checkout, then
+`abuild checksum`. The install paths matter — `a506_zap.*` go directly in
+`/lib/firmware` (the msm/adreno driver looks up `"a506_zap.mdt"` unprefixed),
+the a530 microcode goes under `/lib/firmware/qcom`:
+
+```sh
+mkdir -p pmaports/device/testing/firmware-meizu-m1721
+cd pmaports/device/testing/firmware-meizu-m1721
+cp /path/to/{a506_zap.mdt,a506_zap.b00,a506_zap.b01,a506_zap.b02,a530_pm4.fw,a530_pfp.fw,a530v3_gpmu.fw2} .
+
+cat > APKBUILD <<'AP'
+# Maintainer: nomorecoolnicknames <78512247+nomorecoolnicknames@users.noreply.github.com>
+pkgname=firmware-meizu-m1721
+pkgver=1
+pkgrel=0
+pkgdesc="GPU firmware for Meizu M6 Note (Adreno 506 ZAP + a530 render microcode)"
+url="https://postmarketos.org"
+arch="aarch64"
+license="proprietary"
+options="!check !strip !archcheck !tracedeps pmb:cross-native"
+source="
+	a506_zap.mdt a506_zap.b00 a506_zap.b01 a506_zap.b02
+	a530_pm4.fw a530_pfp.fw a530v3_gpmu.fw2
+"
+package() {
+	install -Dm644 "$srcdir"/a506_zap.mdt -t "$pkgdir"/lib/firmware
+	install -Dm644 "$srcdir"/a506_zap.b00 -t "$pkgdir"/lib/firmware
+	install -Dm644 "$srcdir"/a506_zap.b01 -t "$pkgdir"/lib/firmware
+	install -Dm644 "$srcdir"/a506_zap.b02 -t "$pkgdir"/lib/firmware
+	install -Dm644 "$srcdir"/a530_pm4.fw   -t "$pkgdir"/lib/firmware/qcom
+	install -Dm644 "$srcdir"/a530_pfp.fw   -t "$pkgdir"/lib/firmware/qcom
+	install -Dm644 "$srcdir"/a530v3_gpmu.fw2 -t "$pkgdir"/lib/firmware/qcom
+}
+AP
+
+pmbootstrap checksum firmware-meizu-m1721   # or: abuild checksum
+```
+
+The `device-meizu-m1721` package already `depends` on `firmware-meizu-m1721`, so
+once this aport exists in your pmaports tree it is pulled into the rootfs.
 
 ## Building
 
