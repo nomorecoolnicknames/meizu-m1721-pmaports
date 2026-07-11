@@ -1,0 +1,36 @@
+# Maintainer: nomorecoolnicknames <78512247+nomorecoolnicknames@users.noreply.github.com>
+pkgname=firmware-meizu-m1721
+pkgver=1
+pkgrel=0
+pkgdesc="Adreno 506 ZAP shader firmware for the Meizu M6 Note (m1721)"
+url="https://postmarketos.org"
+arch="aarch64"
+license="proprietary"
+options="!check !strip !archcheck !tracedeps !spdx pmb:cross-native"
+# The a506 ZAP shader is fetched from the MeizuCustoms LineageOS vendor tree
+# (byte-identical to the stock /vendor/firmware blobs). The a530 render
+# microcode is provided separately by the firmware-qcom-adreno-a530 package,
+# which device-meizu-m1721 already depends on.
+_sha=8c2cab935a0226d9f922104cfd265f9c288a0619
+_url="https://raw.githubusercontent.com/meizucustoms/proprietary_vendor_meizu/$_sha/m1721/proprietary/vendor/firmware"
+source="
+	a506_zap.mdt::$_url/a506_zap.mdt
+	a506_zap.b00::$_url/a506_zap.b00
+	a506_zap.b01::$_url/a506_zap.b01
+	a506_zap.b02::$_url/a506_zap.b02
+"
+
+package() {
+	# ZAP shader goes directly in /lib/firmware — the msm/adreno driver looks
+	# it up unprefixed as "a506_zap.mdt".
+	install -Dm644 "$srcdir"/a506_zap.mdt -t "$pkgdir"/lib/firmware
+	install -Dm644 "$srcdir"/a506_zap.b00 -t "$pkgdir"/lib/firmware
+	install -Dm644 "$srcdir"/a506_zap.b01 -t "$pkgdir"/lib/firmware
+	install -Dm644 "$srcdir"/a506_zap.b02 -t "$pkgdir"/lib/firmware
+}
+sha512sums="
+bdff73127e13d2078100456d4fb4cb7944c749b87f1cd01cc704da509b036576b0adedcdd1ab2270b6123ca8ab47a5549f8c7394b15c672e25e1dac66c266012  a506_zap.mdt
+6e8001b0d134e4e77c18a6c7782252ea3eaa31e333dd1c399f434f3cbfff15ae8155a7262a567fc7e9fa9048e490621564d968e843c86d4ecbdd0f712579d341  a506_zap.b00
+1f646da43d9abe90fa4799aa5ac7a7392b11a534b6a2ca66818959870a3704367a6fb26dd78d4c73c398c4c2d9a420df7476cfb169e10b6572be530175a5ed3e  a506_zap.b01
+1dbf3f7b2092517b6521e8937582b58b19a6846c9076a5f027c887ecb63fbe3b6726fdb65f89b72cea8a240900377f760375ff25dec3ca9ba0ab83cba4c2b50d  a506_zap.b02
+"
