@@ -1,0 +1,56 @@
+From: local <local@postmarketos>
+Subject: [PATCH] wcn36xx: allow disabling VHT-sized firmware requests
+
+The WCN v2.0 firmware shipped on the Meizu M6 Note rejects the larger
+VHT-capable CONFIG_STA and CONFIG_BSS request layouts with status 5. This
+leaves the interface associated but causes every WPA four-way handshake to
+time out.
+
+Keep the normal behaviour by default, use the older no-VHT layout on the
+Meizu M6 Note, and expose a module option for testing other affected devices.
+
+--- a/drivers/net/wireless/ath/wcn36xx/smd.c
++++ b/drivers/net/wireless/ath/wcn36xx/smd.c
+@@ -20,6 +20,7 @@
+ #include <linux/firmware.h>
+ #include <linux/bitops.h>
+ #include <linux/rpmsg.h>
++#include <linux/of.h>
+ #include "smd.h"
+ #include "firmware.h"
+ 
+@@ -27,6 +28,16 @@ struct wcn36xx_cfg_val {
+ 	u32 value;
+ };
+ 
++static bool disable_vht;
++module_param(disable_vht, bool, 0644);
++MODULE_PARM_DESC(disable_vht,
++		 "Use no-VHT CONFIG_STA and CONFIG_BSS firmware request layouts");
++
++static bool wcn36xx_use_no_vht_layout(void)
++{
++	return disable_vht || of_machine_is_compatible("meizu,m1721");
++}
++
+ #define WCN36XX_CFG_VAL(id, val) \
+ { \
+ 	.cfg_id = WCN36XX_HAL_CFG_ ## id, \
+@@ -1444,7 +1449,7 @@ static int wcn36xx_smd_config_sta_v1(struct wcn36xx *wcn,
+ 	struct wcn36xx_hal_config_sta_req_msg_v1 msg_body;
+ 	struct wcn36xx_hal_config_sta_params_v1 *sta_params;
+ 
+-	if (wcn->rf_id == RF_IRIS_WCN3680) {
++	if (wcn->rf_id == RF_IRIS_WCN3680 && !wcn36xx_use_no_vht_layout()) {
+ 		INIT_HAL_MSG_V1(msg_body, WCN36XX_HAL_CONFIG_STA_REQ);
+ 	} else {
+ 		INIT_HAL_MSG(msg_body, WCN36XX_HAL_CONFIG_STA_REQ);
+@@ -1627,7 +1632,7 @@ static int wcn36xx_smd_config_bss_v1(struct wcn36xx *wcn,
+ 	if (!msg_body)
+ 		return -ENOMEM;
+ 
+-	if (wcn->rf_id == RF_IRIS_WCN3680) {
++	if (wcn->rf_id == RF_IRIS_WCN3680 && !wcn36xx_use_no_vht_layout()) {
+ 		INIT_HAL_MSG_V1((*msg_body), WCN36XX_HAL_CONFIG_BSS_REQ);
+ 	} else {
+ 		INIT_HAL_MSG((*msg_body), WCN36XX_HAL_CONFIG_BSS_REQ);
