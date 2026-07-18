@@ -6,7 +6,7 @@
 _flavor="postmarketos-qcom-msm8953"
 pkgname=linux-$_flavor
 pkgver=7.0.9
-pkgrel=10
+pkgrel=11
 pkgdesc="Close to mainline linux kernel for Qualcomm Snapdragon MSM8953"
 arch="aarch64"
 _carch="arm64"
@@ -80,7 +80,7 @@ package() {
 sha512sums="
 660bb93c2d19efe27a0c19a795801cbbf092f19589b96a857e320345b406a887498a0ab6b0e435b3ef5c244f5c193f82c8a61876853f3a6c1cf0932632d00c5f  linux-postmarketos-qcom-msm8953-v7.0.9-r0.tar.gz
 f94124ee5fec4497eb4f206c32daebc02fbbfcc01c868a434d67830441a69dca885aaee5866823ca67ae58ed7ce247e86875ea0f4f6ade1433d776c94829129b  config-postmarketos-qcom-msm8953.aarch64
-bd568296b917402a91c5348c963dc82e6b3d28cb610f3d9232db514e798af7f8638c9f6b7c6785c1cf7346f8bfaf9b8892447d105a87c1c1d856bf652afbf300  0001-arm64-dts-qcom-add-Meizu-M6-Note-m1721.patch
+76838749961637d7c5918195363b2bb8dac6b7c442f70e43d9f1792dac784f3604a8952467a4806a67d418dd6d5ed73dcf450132894796dee55f95c749dc4619  0001-arm64-dts-qcom-add-Meizu-M6-Note-m1721.patch
 1d28a01b069e640b030462740ca3259c1d7c8a5aa395306a85c664f1ce416a1d709867c6083360afb37fd9bdb12ecbc43f6f854a0adcdce5a6a28d3d494d0d67  0002-drm-panel-add-Meizu-M6-Note-m1721-HX8399C-TCL-panel-.patch
 4e000b4d3937d718e4fc4480df0e7e5a7953cc40a9b3602a6c2dee1dfefc7a9bb93564f2fe23cfd8545542ed64ba21e9f0a954e5fd1198641b5f2a78dff6f6ae  0003-media-i2c-add-Sony-IMX362-sensor-driver.patch
 0b7e331121037c6371fb4a01b2ec01dd00fc437774f6f0b7a3d5aa34e9c1d97af43a6ca48a5cdc970a30925fa49ff7761a0d2ddbe004cf7ecd77114df39ea52a  0004-ASoC-cs35l35-return-ENOTSUPP-for-unsupported-sysclk.patch
