@@ -6,7 +6,7 @@
 _flavor="postmarketos-qcom-msm8953"
 pkgname=linux-$_flavor
 pkgver=7.0.9
-pkgrel=10
+pkgrel=11
 pkgdesc="Close to mainline linux kernel for Qualcomm Snapdragon MSM8953"
 arch="aarch64"
 _carch="arm64"
@@ -48,6 +48,7 @@ source="
 	0012-Input-qcom-spmi-haptics-enable-output-stage-fix-debo.patch
 	0013-ASoC-qdsp6-q6voice-re-create-CVP-session-on-in-call-.patch
 	0014-iio-light-add-Lite-On-LTR-578ALS-driver.patch
+	0015-wcn36xx-add-disable-vht-module-option.patch
 "
 builddir="$srcdir/linux-$_tag"
 
@@ -94,4 +95,5 @@ cc20522ddd020953468495d0144987d0e29ab5ba911723eb03a7870bb25246e750ad37e5d054514e
 00a78024cb40fc8e17cb7875e2a713d5c07caca99769e33b4bcae38de71e7a73f1fc2f89e9ad86ecc166aacd3eef9f6c1216ac54ab43012b4f1657dd1f188828  0012-Input-qcom-spmi-haptics-enable-output-stage-fix-debo.patch
 f163447197bef49505e96d9f6a27a56264aef95bbd3fc6c85803235b7ef56d18f58aa99af68623c62559688ab833e3ea4531e7672cce161f7b11741cd3e28964  0013-ASoC-qdsp6-q6voice-re-create-CVP-session-on-in-call-.patch
 b1b6df518ca4c07828fece77ef57a4769e9589af5e538b06676e3d0c6c2f4518539a53136ba08eb8f59e756493b2dffbc01eb3a4742dc6c06bab28f1a096f45e  0014-iio-light-add-Lite-On-LTR-578ALS-driver.patch
+f7143e6b784585d4f95913bdf5a5687c9afaa7fc28c8c183d5e3cdd6255cdd58f3c5c739c2cd373c9ac9dd2f2b61f141693380be992b89a01faae22cd7204a11  0015-wcn36xx-add-disable-vht-module-option.patch
 "
