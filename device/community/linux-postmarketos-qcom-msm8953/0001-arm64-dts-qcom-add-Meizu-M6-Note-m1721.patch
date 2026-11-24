@@ -27,8 +27,8 @@ Signed-off-by: nomorecoolnicknames <78512247+nomorecoolnicknames@users.noreply.g
 Assisted-by: Claude (Anthropic)
 ---
  arch/arm64/boot/dts/qcom/Makefile             |   1 +
- .../boot/dts/qcom/msm8953-meizu-m1721.dts     | 815 ++++++++++++++++++
- 2 files changed, 816 insertions(+)
+ .../boot/dts/qcom/msm8953-meizu-m1721.dts     | 831 ++++++++++++++++++
+ 2 files changed, 832 insertions(+)
  create mode 100644 arch/arm64/boot/dts/qcom/msm8953-meizu-m1721.dts
 
 diff --git a/arch/arm64/boot/dts/qcom/Makefile b/arch/arm64/boot/dts/qcom/Makefile
@@ -48,7 +48,7 @@ new file mode 100644
 index 000000000..d310cdfe6
 --- /dev/null
 +++ b/arch/arm64/boot/dts/qcom/msm8953-meizu-m1721.dts
-@@ -0,0 +1,815 @@
+@@ -0,0 +1,831 @@
 +// SPDX-License-Identifier: BSD-3-Clause
 +/*
 + * Meizu M6 Note (m1721)
@@ -105,7 +105,8 @@ index 000000000..d310cdfe6
 +		compatible = "gpio-keys";
 +
 +		pinctrl-names = "default";
-+		pinctrl-0 = <&gpio_key_default>, <&gpio_hall_sensor_default>;
++		pinctrl-0 = <&gpio_key_default>, <&gpio_home_default>,
++			    <&gpio_hall_sensor_default>;
 +
 +		event-hall-sensor {
 +			label = "Hall Effect Sensor";
@@ -119,6 +120,14 @@ index 000000000..d310cdfe6
 +			label = "Volume Up";
 +			gpios = <&tlmm 85 GPIO_ACTIVE_LOW>;
 +			linux,code = <KEY_VOLUMEUP>;
++		};
++
++		key-home {
++			label = "Home";
++			gpios = <&tlmm 141 GPIO_ACTIVE_LOW>;
++			linux,code = <KEY_HOME>;
++			debounce-interval = <15>;
++			wakeup-source;
 +		};
 +	};
 +
@@ -653,6 +662,13 @@ index 000000000..d310cdfe6
 +		bias-disable;
 +	};
 +
++	gpio_home_default: gpio-home-state {
++		pins = "gpio141";
++		function = "gpio";
++		drive-strength = <2>;
++		bias-pull-up;
++	};
++
 +	gpio_hall_sensor_default: gpio-hall-sensor-state {
 +		pins = "gpio13";
 +		function = "gpio";
@@ -866,4 +882,3 @@ index 000000000..d310cdfe6
 +};
 -- 
 2.39.5
-
